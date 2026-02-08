@@ -1,0 +1,10 @@
+# ninja log v5
+1	18569	1725980313006585824	/media/lz_chenzhen/chenying/MSFNet-mamba/kernels/selective_scan/build/temp.linux-x86_64-cpython-310/csrc/selective_scan/cus/selective_scan_core_fwd.o	d1a1a28e0c1abc42
+1	59712	1725980354123329105	/media/lz_chenzhen/chenying/MSFNet-mamba/kernels/selective_scan/build/temp.linux-x86_64-cpython-310/csrc/selective_scan/cus/selective_scan_core_bwd.o	c1b38fedc3848139
+0	81107	1725980375543702404	/media/lz_chenzhen/chenying/MSFNet-mamba/kernels/selective_scan/build/temp.linux-x86_64-cpython-310/csrc/selective_scan/cus/selective_scan.o	60e0e89f2d8315ed
+11	17878	1725980394548026030	/media/lz_chenzhen/chenying/MSFNet-mamba/kernels/selective_scan/build/temp.linux-x86_64-cpython-310/csrc/selective_scan/cusndstate/selective_scan_core_fwd.o	65cdaa19bb40fca6
+12	22743	1725980399420107883	/media/lz_chenzhen/chenying/MSFNet-mamba/kernels/selective_scan/build/temp.linux-x86_64-cpython-310/csrc/selective_scan/cusndstate/selective_scan_ndstate.o	fc54aab52217521f
+11	58654	1725980435304697309	/media/lz_chenzhen/chenying/MSFNet-mamba/kernels/selective_scan/build/temp.linux-x86_64-cpython-310/csrc/selective_scan/cusndstate/selective_scan_core_bwd.o	cffea01a4d7b0dd3
+13	21751	1725980457925057176	/media/lz_chenzhen/chenying/MSFNet-mamba/kernels/selective_scan/build/temp.linux-x86_64-cpython-310/csrc/selective_scan/cusoflex/selective_scan_oflex.o	75406039edc68ac7
+11	25005	1725980461157107885	/media/lz_chenzhen/chenying/MSFNet-mamba/kernels/selective_scan/build/temp.linux-x86_64-cpython-310/csrc/selective_scan/cusoflex/selective_scan_core_fwd.o	2a725a7b1e787ad1
+10	88937	1725980525082076496	/media/lz_chenzhen/chenying/MSFNet-mamba/kernels/selective_scan/build/temp.linux-x86_64-cpython-310/csrc/selective_scan/cusoflex/selective_scan_core_bwd.o	59878d754d02fa7d

@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+
+# PyTorch
+*.pth
+*.pt
+checkpoints/
+exp/
+logs/
+wandb/
+
+# Data & Results
+results/
+inference_results/
+inference_results_noise/
+*.h5
+*.wav
+
+# Generated Plots
+*.png
+*.jpg
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Compiled extensions
+*.so

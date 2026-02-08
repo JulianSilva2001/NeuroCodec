@@ -1,0 +1,10 @@
+# ninja log v7
+2	12902	1769850246944289875	/home/jaliya/eeg_speech/navindu/M3ANet-main/kernels/selective_scan/build/temp.linux-x86_64-cpython-38/csrc/selective_scan/cus/selective_scan_core_fwd.o	dcb4077c1efb9ddf
+1	32331	1769850246943289890	/home/jaliya/eeg_speech/navindu/M3ANet-main/kernels/selective_scan/build/temp.linux-x86_64-cpython-38/csrc/selective_scan/cus/selective_scan.o	15e79d574b37de5d
+1	35397	1769850246943289890	/home/jaliya/eeg_speech/navindu/M3ANet-main/kernels/selective_scan/build/temp.linux-x86_64-cpython-38/csrc/selective_scan/cus/selective_scan_core_bwd.o	ae5fa9389c7c4b12
+8	12292	1769850283146776740	/home/jaliya/eeg_speech/navindu/M3ANet-main/kernels/selective_scan/build/temp.linux-x86_64-cpython-38/csrc/selective_scan/cusndstate/selective_scan_core_fwd.o	eebd43b9fa2d42ac
+8	31542	1769850283146776740	/home/jaliya/eeg_speech/navindu/M3ANet-main/kernels/selective_scan/build/temp.linux-x86_64-cpython-38/csrc/selective_scan/cusndstate/selective_scan_ndstate.o	2a5d0141b748191b
+7	33591	1769850283145776754	/home/jaliya/eeg_speech/navindu/M3ANet-main/kernels/selective_scan/build/temp.linux-x86_64-cpython-38/csrc/selective_scan/cusndstate/selective_scan_core_bwd.o	7a104abebe945416
+8	17888	1769850317531315346	/home/jaliya/eeg_speech/navindu/M3ANet-main/kernels/selective_scan/build/temp.linux-x86_64-cpython-38/csrc/selective_scan/cusoflex/selective_scan_core_fwd.o	90946eaf0eebc4b4
+8	33712	1769850317531315346	/home/jaliya/eeg_speech/navindu/M3ANet-main/kernels/selective_scan/build/temp.linux-x86_64-cpython-38/csrc/selective_scan/cusoflex/selective_scan_oflex.o	741caee1ecda8c36
+7	53953	1769850317530315360	/home/jaliya/eeg_speech/navindu/M3ANet-main/kernels/selective_scan/build/temp.linux-x86_64-cpython-38/csrc/selective_scan/cusoflex/selective_scan_core_bwd.o	90384f9fcee1c8d0
