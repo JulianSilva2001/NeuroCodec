@@ -148,7 +148,42 @@ def inference(args):
             plt.title(f"{title} Spectrogram")
             plt.colorbar(format='%+2.0f dB')
         
-        plot_waveform_spectrogram(noisy_np, "Input (Noisy)", 0)
+        # 5. Calculate Metrics (Multi-Rate)
+        clean_torch = clean.cpu()
+        pred_torch = pred_audio.cpu()
+        
+        # A. 44.1kHz (Original)
+        si_sdr_44 = sisdr(clean_torch.numpy().squeeze(), pred_torch.numpy().squeeze())
+        
+        # B. 16kHz (Wideband Speech)
+        resampler_16k = torchaudio.transforms.Resample(44100, 16000)
+        clean_16k = resampler_16k(clean_torch).numpy().squeeze()
+        pred_16k = resampler_16k(pred_torch).numpy().squeeze()
+        si_sdr_16 = sisdr(clean_16k, pred_16k)
+        
+        # C. 8kHz (Narrowband / Telephony - Common in older papers)
+        resampler_8k = torchaudio.transforms.Resample(44100, 8000)
+        clean_8k = resampler_8k(clean_torch).numpy().squeeze()
+        pred_8k = resampler_8k(pred_torch).numpy().squeeze()
+        si_sdr_8 = sisdr(clean_8k, pred_8k)
+        
+        # Oracle SI-SDR (DAC Reconstruction Upper Bound)
+        with torch.no_grad():
+            z_gt, _, _, _, _ = model.dac.encode(clean)
+            clean_recon = model.dac.decode(z_gt)
+            min_len_oracle = min(clean_recon.shape[-1], clean.shape[-1])
+            clean_recon = clean_recon[..., :min_len_oracle]
+            clean_target_oracle = clean[..., :min_len_oracle]
+            
+        si_sdr_oracle = sisdr(clean_target_oracle.cpu().numpy().squeeze(), clean_recon.cpu().numpy().squeeze())
+
+        print(f"Metrics Sample {i}:")
+        print(f"  Oracle SI-SDR (DAC Bound): {si_sdr_oracle:.2f} dB")
+        print(f"  SI-SDR @ 44.1kHz: {si_sdr_44:.2f} dB")
+        print(f"  SI-SDR @ 16.0kHz: {si_sdr_16:.2f} dB (Standard Speech)")
+        print(f"  SI-SDR @  8.0kHz: {si_sdr_8:.2f} dB (Telephony/Old Papers)")
+        
+        plot_waveform_spectrogram(noisy.cpu().numpy().squeeze(), "Input (Noisy)", 0)
         plot_waveform_spectrogram(clean_np, "Target (Clean)", 1)
         plot_waveform_spectrogram(pred_np, "Prediction", 2)
         
