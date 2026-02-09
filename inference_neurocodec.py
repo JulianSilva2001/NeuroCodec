@@ -80,9 +80,9 @@ def inference(args):
             pred_audio = model.dac.decode(z_q)
             
         # 4. Save Audio
-        output_dir = "results/NeuroCodec/Inference"
+        output_dir = "results/NeuroCodec_cos5_latest/Inference"
         if args.noise_cue:
-            output_dir = "results/NeuroCodec/Inference_NoiseCue"
+            output_dir = "results/NeuroCodec_cos5_latest/Inference_NoiseCue"
             
         os.makedirs(output_dir, exist_ok=True)
         
@@ -160,7 +160,7 @@ def inference(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', type=str, default='/home/jaliya/eeg_speech/navindu/data/Cocktail_Party/Normalized-2/2s/eeg/new')
-    parser.add_argument('--checkpoint', type=str, default='checkpoints/neurocodec/best_model.pth')
+    parser.add_argument('--checkpoint', type=str, default='checkpoints/neurocodec_cos5/latest_model.pth')
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--subset', type=str, default='test', help="Dataset subset to use (train, val, test)")
     parser.add_argument('--num_samples', type=int, default=10, help="Number of samples to process")

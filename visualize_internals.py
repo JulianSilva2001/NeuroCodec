@@ -61,7 +61,7 @@ def visualize(args):
     z_gt_map = z_target[0].cpu().numpy()
     
     # 5. Plotting
-    output_dir = "results/NeuroCodec/Internals"
+    output_dir = "results/NeuroCodec_cos5_clip/Internals"
     os.makedirs(output_dir, exist_ok=True)
     
     plt.figure(figsize=(15, 16))
@@ -92,21 +92,30 @@ def visualize(args):
     plt.xlabel("EEG Time (Key)")
     
     # C. Z-Prediction
+    # D. Histograms of Values
     plt.subplot(4, 2, 7)
-    sns.heatmap(z_gt_map[:, :limit], cmap='coolwarm', cbar=True, vmin=-5, vmax=5)
-    plt.title(f"Ground Truth Z (First {limit} Frames)")
-    plt.ylabel("Feature Dim (1024)")
-    plt.xlabel("Time")
+    sns.histplot(z_gt_map.flatten(), color='blue', label='GT', stat='density', alpha=0.5, bins=50)
+    sns.histplot(z_pred_map.flatten(), color='red', label='Pred', stat='density', alpha=0.5, bins=50)
+    plt.title("Z-Value Distribution (Checking for Collapse)")
+    plt.legend()
+    
+    # E. Cosine Similarity per Frame
+    from sklearn.metrics.pairwise import cosine_similarity
+    # (1024, T) -> (T, 1024)
+    sim = torch.nn.functional.cosine_similarity(torch.from_numpy(z_gt_map), torch.from_numpy(z_pred_map), dim=0)
     
     plt.subplot(4, 2, 8)
-    sns.heatmap(z_pred_map[:, :limit], cmap='coolwarm', cbar=True, vmin=-5, vmax=5)
-    plt.title(f"Predicted Z (First {limit} Frames)")
-    plt.ylabel("Feature Dim (1024)")
-    plt.xlabel("Time")
+    plt.plot(sim.numpy())
+    plt.title(f"Frame-wise Cosine Similarity (Mean: {sim.mean():.4f})")
+    plt.ylim(-1, 1)
+    plt.grid(True, alpha=0.3)
     
     print("\nDEBUG STATS:")
     print(f"Raw EEG   - Global Std: {raw_eeg_map.std():.4f}, Temporal Std: {np.mean(raw_eeg_map.std(axis=-1)):.4f}")
     print(f"EEG Feat  - Global Std: {eeg_map.std():.4f}, Temporal Std: {np.mean(eeg_map.std(axis=-1)):.4f}")
+    print(f"Z GT      - Mean: {z_gt_map.mean():.4f}, Std: {z_gt_map.std():.4f}")
+    print(f"Z Pred    - Mean: {z_pred_map.mean():.4f}, Std: {z_pred_map.std():.4f}")
+    print(f"Cosine Sim- Mean: {sim.mean():.4f}")
     
     plt.tight_layout()
     plt.savefig(f"{output_dir}/internals_plot.png")
@@ -114,8 +123,8 @@ def visualize(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root', type=str, default='/home/jaliya/eeg_speech/navindu/data/Cocktail_Party/Normalized/2s/eeg/new')
-    parser.add_argument('--checkpoint', type=str, default='checkpoints/neurocodec/best_model.pth')
+    parser.add_argument('--root', type=str, default='/home/jaliya/eeg_speech/navindu/data/Cocktail_Party/Normalized-2/2s/eeg/new')
+    parser.add_argument('--checkpoint', type=str, default='checkpoints/neurocodec_cos5/latest_model.pth')
     parser.add_argument('--gpu', type=int, default=0)
     args = parser.parse_args()
     visualize(args)

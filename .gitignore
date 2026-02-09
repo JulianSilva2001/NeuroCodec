@@ -20,8 +20,10 @@ wandb/
 results/
 inference_results/
 inference_results_noise/
+experiments/
 *.h5
 *.wav
+*.npy
 
 # Generated Plots
 *.png

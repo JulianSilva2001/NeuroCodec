@@ -7,13 +7,13 @@ import torch.nn.functional as F
 def normalize_A(A,lmax=2):   # A(128,128)
     A=F.relu(A)
     N=A.shape[0]
-    A=A*(torch.ones(N,N).cuda()-torch.eye(N,N).cuda())
+    A=A*(torch.ones(N,N).to(A.device)-torch.eye(N,N).to(A.device))
     A=A+A.T
     d = torch.sum(A, 1)
     d = 1 / torch.sqrt((d + 1e-10))
     D = torch.diag_embed(d)
-    L = torch.eye(N,N).cuda()-torch.matmul(torch.matmul(D, A), D)
-    Lnorm=(2*L/lmax)-torch.eye(N,N).cuda()
+    L = torch.eye(N,N).to(A.device)-torch.matmul(torch.matmul(D, A), D)
+    Lnorm=(2*L/lmax)-torch.eye(N,N).to(A.device)
     return Lnorm    #(128,128)
 
 
@@ -21,7 +21,7 @@ def generate_cheby_adj(L, K):
     support = []
     for i in range(K):
         if i == 0:
-            support.append(torch.eye(L.shape[-1]).cuda())
+            support.append(torch.eye(L.shape[-1]).to(L.device))
         elif i == 1:
             support.append(L)
         else:

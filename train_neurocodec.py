@@ -12,6 +12,7 @@ import numpy as np
 # Local imports
 from models.neurocodec import NeuroCodec
 from dataset_neurocodec import load_NeuroCodecDataset
+from losses_neurocodec import NeuroCodecLoss
 
 def sisdr(reference, estimation):
     """
@@ -75,10 +76,8 @@ def train(args):
     ).to(device)
     
     # 4. Optimizer
-    # 4. Optimizer
-    # 4. Optimizer
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
-    criterion = nn.MSELoss()
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-2) # Increased WD to 0.05
+    criterion = NeuroCodecLoss(lambda_cosine=5.0) # Increased weight to 5.0
     
     # Scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -107,16 +106,24 @@ def train(args):
             # B. Forward Pass
             z_pred, _, _, _, _ = model(noisy, eeg)
             
-            # C. Compute Loss (MSE)
-            loss = criterion(z_pred, z_target)
+            # C. Compute Loss
+            loss, loss_dict = criterion(z_pred, z_target)
             
             # D. Backend
             optimizer.zero_grad()
             loss.backward()
+            
+            # Gradient Clipping (Prevent Explosion)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
             optimizer.step()
             
             train_loss += loss.item()
-            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+            pbar.set_postfix({
+                'loss': f"{loss.item():.4f}", 
+                'mse': f"{loss_dict['mse']:.4f}",
+                'cos': f"{loss_dict['cosine']:.4f}"
+            })
             
             # Optional: Overfit check (break early)
             if args.debug and batch_idx > 5:
@@ -162,8 +169,8 @@ def validate(model, loader, criterion, device, args):
             # 2. Model Forward (Z Pred)
             z_pred, _, _, _, _ = model(noisy, eeg)
             
-            # 3. Loss (MSE)
-            loss = criterion(z_pred, z_target)
+            # 3. Loss
+            loss, _ = criterion(z_pred, z_target)
             total_loss += loss.item()
             
             # 4. Neural Decoding & SI-SDR
@@ -207,9 +214,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', type=str, default='/home/jaliya/eeg_speech/navindu/data/Cocktail_Party/Normalized/2s/eeg/new')
     parser.add_argument('--batch_size', type=int, default=2)
-    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--lr', type=float, default=2e-4)
     parser.add_argument('--epochs', type=int, default=10)
-    parser.add_argument('--hidden_dim', type=int, default=256)
+    parser.add_argument('--hidden_dim', type=int, default=128)
     parser.add_argument('--num_layers', type=int, default=4)
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/neurocodec')
