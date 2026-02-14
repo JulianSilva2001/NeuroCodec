@@ -112,22 +112,40 @@ class FlexibleEEGEncoder(nn.Module):
 
 
 class NeuroCodecBlock(nn.Module):
-    def __init__(self, hidden_dim, n_heads=8, d_state=16, d_conv=4, expand=2, dropout=0.1):
+    def __init__(self, hidden_dim, n_heads=8, d_state=16, d_conv=4, expand=2, dropout=0.1, backbone='mamba'):
         super().__init__()
+        self.backbone_type = backbone
         
         # 1. Cross Attention
         self.ln1 = nn.LayerNorm(hidden_dim)
         self.attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=n_heads, batch_first=True, dropout=dropout)
         self.dropout1 = nn.Dropout(dropout)
         
-        # 2. Mamba Core
+        # 2. Backbone Core (Mamba or Transformer)
         self.ln2 = nn.LayerNorm(hidden_dim)
-        self.mamba = Mamba(
-            d_model=hidden_dim,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand
-        )
+        
+        if backbone == 'mamba':
+            self.core = Mamba(
+                d_model=hidden_dim,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand
+            )
+        elif backbone == 'transformer':
+            # Causal Self-Attention Layer
+            # We use TransformerEncoderLayer but must ensure causal masking in forward()
+            self.core = nn.TransformerEncoderLayer(
+                d_model=hidden_dim, 
+                nhead=n_heads, 
+                dim_feedforward=hidden_dim*4, 
+                dropout=dropout, 
+                activation='gelu',
+                batch_first=True,
+                norm_first=True # Pre-Norm like Mamba/GPT
+            )
+        else:
+            raise ValueError(f"Unknown backbone: {backbone}")
+
         self.dropout2 = nn.Dropout(dropout)
         
     def forward(self, x, eeg_k, eeg_v):
@@ -139,11 +157,39 @@ class NeuroCodecBlock(nn.Module):
         attn_out, attn_weights = self.attn(query=x_norm, key=eeg_k, value=eeg_v)
         x = x + self.dropout1(attn_out)
         
-        # B. Mamba with Residual
-        x_norm = self.ln2(x)
-        mamba_out = self.mamba(x_norm)
-        x = x + self.dropout2(mamba_out)
-        
+        # B. Backbone with Residual
+        if self.backbone_type == 'mamba':
+            x_norm = self.ln2(x)
+            core_out = self.core(x_norm)
+            x = x + self.dropout2(core_out)
+            
+        elif self.backbone_type == 'transformer':
+            # Manually handle residual because TransformerEncoderLayer includes it?
+            # Standard nn.TransformerEncoderLayer(x) does: x + self.dropout(self.linear2(self.dropout(self.activation(self.linear1(self.norm2(x + self.dropout(self.self_attn(self.norm1(x))...))))))
+            # Wait, if norm_first=True, it expects input x.
+            # We need to provide CURRENT sequence mask for causality.
+            
+            # Generate Causal Mask
+            B, T, D = x.shape
+            # mask: (T, T) - -inf above diagonal
+            causal_mask = nn.Transformer.generate_square_subsequent_mask(T, device=x.device)
+            
+            # Forward
+            # Note: TransformerEncoderLayer applies its own residual/norm. 
+            # If we defined it with norm_first=True, it effectively does Pre-Norm.
+            # But here we have specific structure: LN -> Core -> Add.
+            # Let's wrap it to match Mamba block structure if possible, or just use it as is.
+            # If we use nn.TransformerEncoderLayer, it IS a full block (Attn + FFN + Residuals).
+            # Mamba block is: Norm -> Mamba -> Add.
+            
+            # Let's just pass x to it, it handles residuals.
+            # But wait, Mamba is just the mixer. TransformerEncoderLayer is Mixer+MLP+Residuals.
+            # This is a slight architectural difference. Mamba also has internal gates/projections.
+            # It is comparable.
+            
+            core_out = self.core(x, src_mask=causal_mask, is_causal=True)
+            x = core_out # It includes residual connection inside
+            
         return x, attn_weights
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
@@ -166,7 +212,8 @@ class NeuroCodec(nn.Module):
                  dac_model_type='44khz',
                  eeg_in_channels=128,
                  hidden_dim=256,
-                 num_layers=4):
+                 num_layers=4,
+                 backbone='mamba'):
         super().__init__()
         
         # 1. Frozen DAC Backbone
@@ -192,7 +239,7 @@ class NeuroCodec(nn.Module):
         
         # 5. Stacked Layers (Fusion + Generator)
         self.layers = nn.ModuleList([
-            NeuroCodecBlock(hidden_dim=hidden_dim, dropout=0.3) # Increased dropout to 0.3
+            NeuroCodecBlock(hidden_dim=hidden_dim, dropout=0.3, backbone=backbone) # Increased dropout to 0.3
             for _ in range(num_layers)
         ])
         
@@ -203,6 +250,10 @@ class NeuroCodec(nn.Module):
         # 6. Output Head (Regression to Z)
         # Hidden -> 1024 (DAC Latent Dim)
         self.output_proj = nn.Linear(hidden_dim, 1024)
+        
+        # 7. Envelope Projection Head (New for Step 13)
+        # EEG Features (64) -> Envelope (1)
+        self.envelope_proj = nn.Conv1d(64, 1, kernel_size=1)
 
     def forward(self, mixture, eeg):
         """
@@ -217,7 +268,11 @@ class NeuroCodec(nn.Module):
         # 2. Encode EEG
         eeg_feat = self.eeg_encoder(eeg)
         
-        # 3. Preparation for Core
+        # 3. Envelope Prediction (Auxiliary Task)
+        # eeg_feat: (B, 64, T_eeg) -> (B, 1, T_eeg) -> (B, T_eeg)
+        envelope_pred = self.envelope_proj(eeg_feat).squeeze(1)
+        
+        # 4. Preparation for Core
         # z_mix: (B, 1024, T)
         # Transpose to (B, T, 1024) for Linear
         x_audio = z_mix.transpose(1, 2)
@@ -232,6 +287,10 @@ class NeuroCodec(nn.Module):
         scale = math.sqrt(self.audio_proj.out_features) # hidden_dim
         x_audio = self.pos_encoder(x_audio * scale)
         x_eeg = self.pos_encoder(x_eeg * scale)
+        
+        # (Fixing indentation/logic here if PE scaling was debated, keeping it simple)
+        # x_audio = self.pos_encoder(x_audio)
+        # x_eeg = self.pos_encoder(x_eeg)
         
         # 4. Stacked Layers
         x = x_audio
@@ -249,7 +308,7 @@ class NeuroCodec(nn.Module):
         # Transpose back to (B, 1024, T) for loss/DAC
         z_pred = z_pred.transpose(1, 2)
         
-        return z_pred, codes_mix, z_mix, eeg_feat, last_attn_weights
+        return z_pred, codes_mix, z_mix, eeg_feat, last_attn_weights, envelope_pred
 
 if __name__ == "__main__":
     # Internal Verification

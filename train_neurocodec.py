@@ -11,7 +11,7 @@ import numpy as np
 
 # Local imports
 from models.neurocodec import NeuroCodec
-from dataset_neurocodec import load_NeuroCodecDataset
+from dataset_neurocodec import load_NeuroCodecDataset, load_KUL_NeuroCodecDataset
 from losses_neurocodec import NeuroCodecLoss
 
 def sisdr(reference, estimation):
@@ -50,34 +50,95 @@ def train(args):
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     
     print(f"Training on {device}...")
+    print(f"Backbone: {args.backbone.upper()}")
+    print(f"Dataset: {args.dataset.upper()}")
+    
+    # Initialize WandB
+    if not args.debug:
+        wandb.init(project="NeuroCodec", config=vars(args))
 
     # 2. Dataset
     print("Loading Dataset...")
-    train_loader = load_NeuroCodecDataset(
-        root=args.root, 
-        subset='train', 
-        batch_size=args.batch_size,
-        num_gpus=1 # Simple single GPU for now
-    )
-    val_loader = load_NeuroCodecDataset(
-        root=args.root, 
-        subset='val', 
-        batch_size=args.batch_size, # validation batch size can be same
-        num_gpus=1
-    )
+    if args.dataset == 'kul':
+        args.eeg_channels = 64 # Force 64 for KUL unless specified otherwise? No, respect arg but default is 128.
+        # Check if user overrode default 128
+        # Argparse doesn't tell us if it was default or user-specified easily without a separate flag.
+        # But we can just warn.
+        if args.eeg_channels == 128:
+             print("Info: KUL dataset selected, defaulting EEG channels to 64 (overriding 128).")
+             args.eeg_channels = 64
+        
+        # Audio Configuration for KUL
+        dac_model_type = '16khz'
+        target_fs = 16000
+    else:
+        dac_model_type = '44khz'
+        target_fs = 44100
+
+    if args.dataset == 'cocktail':
+         train_loader = load_NeuroCodecDataset(
+            root=args.root, 
+            subset='train', 
+            batch_size=args.batch_size,
+            num_gpus=1
+        )
+         val_loader = load_NeuroCodecDataset(
+            root=args.root, 
+            subset='val', 
+            batch_size=args.batch_size, 
+            num_gpus=1
+        )
+    elif args.dataset == 'kul':
+         train_loader = load_KUL_NeuroCodecDataset(
+            lmdb_path=args.root, # Root should be LMDB path for KUL
+            subset='train',
+            batch_size=args.batch_size,
+            num_gpus=1,
+            target_fs=target_fs
+         )
+         val_loader = load_KUL_NeuroCodecDataset(
+            lmdb_path=args.root,
+            subset='val',
+            batch_size=args.batch_size,
+            num_gpus=1,
+            target_fs=target_fs
+         )
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
 
     # 3. Model
-    print("Initializing Model...")
+    print(f"Initializing Model (DAC: {dac_model_type})...")
     model = NeuroCodec(
-        dac_model_type='44khz',
-        eeg_in_channels=128,
+        dac_model_type=dac_model_type,
+        eeg_in_channels=args.eeg_channels,
         hidden_dim=args.hidden_dim, # e.g. 256
-        num_layers=args.num_layers  # e.g. 4
+        num_layers=args.num_layers,  # e.g. 4
+        backbone=args.backbone
     ).to(device)
     
+    if not args.debug:
+        wandb.watch(model, log="all", log_freq=100)
+    
+    # 3.1 Load Checkpoint if Exists (Resume Training)
+    latest_checkpoint = os.path.join(args.checkpoint_dir, "latest_model.pth")
+    if os.path.exists(latest_checkpoint):
+        print(f"Resuming from checkpoint: {latest_checkpoint}")
+        try:
+             # Use weights_only=False due to warnings but consider safer alternative if needed
+             checkpoint = torch.load(latest_checkpoint, map_location=device)
+             model.load_state_dict(checkpoint)
+             print("Checkpoint loaded successfully.")
+        except Exception as e:
+             print(f"Failed to load checkpoint: {e}. Starting from scratch.")
+    else:
+        print("No existing checkpoint found. Starting from scratch.")
+    
     # 4. Optimizer
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-2) # Increased WD to 0.05
-    criterion = NeuroCodecLoss(lambda_cosine=5.0) # Increased weight to 5.0
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-2) 
+    
+    # Updated: Transformer Ablation (No Envelope Loss per user request)
+    # lambda_env=0.0 removes PCC loss
+    criterion = NeuroCodecLoss(lambda_recon=1.0, lambda_env=0.0).to(device)
     
     # Scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -104,10 +165,12 @@ def train(args):
                 z_target, _, _, _, _ = model.dac.encode(clean)
                 
             # B. Forward Pass
-            z_pred, _, _, _, _ = model(noisy, eeg)
+            # Updated to unpack env_pred
+            z_pred, _, _, _, _, env_pred = model(noisy, eeg)
             
             # C. Compute Loss
-            loss, loss_dict = criterion(z_pred, z_target)
+            # Updated to pass env_pred and clean audio
+            loss, loss_dict = criterion(z_pred, z_target, env_pred, clean)
             
             # D. Backend
             optimizer.zero_grad()
@@ -121,9 +184,19 @@ def train(args):
             train_loss += loss.item()
             pbar.set_postfix({
                 'loss': f"{loss.item():.4f}", 
-                'mse': f"{loss_dict['mse']:.4f}",
-                'cos': f"{loss_dict['cosine']:.4f}"
+                'mse': f"{loss_dict['loss_recon']:.4f}",
+                'env': f"{loss_dict['loss_env']:.4f}",
+                'pcc': f"{loss_dict['pcc']:.4f}"
             })
+            
+            if not args.debug:
+                wandb.log({
+                    "train_loss": loss.item(),
+                    "train_loss_recon": loss_dict['loss_recon'],
+                    "train_loss_env": loss_dict['loss_env'],
+                    "train_pcc": loss_dict['pcc'],
+                    "lr": current_lr
+                })
             
             # Optional: Overfit check (break early)
             if args.debug and batch_idx > 5:
@@ -136,6 +209,13 @@ def train(args):
         scheduler.step(val_loss)
         
         print(f"Epoch {epoch+1} | Train Loss: {train_loss/len(train_loader):.4f} | Val Loss: {val_loss:.4f} | Val SI-SDR: {val_sisdr:.2f} dB")
+        
+        if not args.debug:
+            wandb.log({
+                "val_loss": val_loss,
+                "val_sisdr": val_sisdr,
+                "epoch": epoch + 1
+            })
         
         # Save Checkpoint
         if val_loss < best_val_loss:
@@ -167,10 +247,10 @@ def validate(model, loader, criterion, device, args):
             z_target, _, _, _, _ = model.dac.encode(clean)
             
             # 2. Model Forward (Z Pred)
-            z_pred, _, _, _, _ = model(noisy, eeg)
+            z_pred, _, _, _, _, env_pred = model(noisy, eeg)
             
             # 3. Loss
-            loss, _ = criterion(z_pred, z_target)
+            loss, _ = criterion(z_pred, z_target, env_pred, clean)
             total_loss += loss.item()
             
             # 4. Neural Decoding & SI-SDR
@@ -212,39 +292,67 @@ def validate(model, loader, criterion, device, args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root', type=str, default='/home/jaliya/eeg_speech/navindu/data/Cocktail_Party/Normalized/2s/eeg/new')
-    parser.add_argument('--batch_size', type=int, default=2)
-    parser.add_argument('--lr', type=float, default=2e-4)
+    parser.add_argument('--root', type=str, default='/home/jaliya/eeg_speech/navindu/data/Cocktail_Party/Normalized-1')
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--epochs', type=int, default=10)
-    parser.add_argument('--hidden_dim', type=int, default=128)
+    parser.add_argument('--hidden_dim', type=int, default=256)
     parser.add_argument('--num_layers', type=int, default=4)
     parser.add_argument('--gpu', type=int, default=0)
-    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/neurocodec')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/neurocodec/KUL/mamba')
     parser.add_argument('--debug', action='store_true', help="Run fast debug mode")
+    parser.add_argument('--dataset', type=str, default='cocktail', choices=['cocktail', 'kul'], help='Dataset to use')
+    parser.add_argument('--eeg_channels', type=int, default=128, help='Number of EEG channels (128 for Cocktail, 64 for KUL)')
+    
     parser.add_argument('--evaluate', action='store_true', help="Run validation only")
     parser.add_argument('--noise_cue', action='store_true', help="Use random noise instead of EEG during validation")
     
+    parser.add_argument('--backbone', type=str, default='mamba', choices=['mamba', 'transformer'], help='Backbone architecture')
+    
     args = parser.parse_args()
+    
+    # Set seed
+    torch.manual_seed(42)
     
     if args.evaluate:
         # Evaluate Only Mode
         device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
         print(f"Evaluating on {device}...")
+        print(f"Backbone: {args.backbone.upper()}")
+        print(f"Dataset: {args.dataset.upper()}")
         
         # Load Data
-        val_loader = load_NeuroCodecDataset(root=args.root, subset='val', batch_size=args.batch_size, num_gpus=1)
+        if args.dataset == 'cocktail':
+             val_loader = load_NeuroCodecDataset(root=args.root, subset='val', batch_size=args.batch_size, num_gpus=1)
+        elif args.dataset == 'kul':
+             val_loader = load_KUL_NeuroCodecDataset(lmdb_path=args.root, subset='val', batch_size=args.batch_size, num_gpus=1)
+             # args.eeg_channels should be set by user or we trust default?
+             # If user didn't set, default is 128 (wrong for KUL).
+             # We should probably force it here if it's default?
+             if args.eeg_channels == 128 and args.dataset == 'kul':
+                 print("Warning: Dataset is KUL but eeg_channels is 128. Assuming user wants 64 (Autofix).")
+                 args.eeg_channels = 64
         
         # Load Model
-        model = NeuroCodec(dac_model_type='44khz', hidden_dim=args.hidden_dim, num_layers=args.num_layers).to(device)
+        model = NeuroCodec(
+            dac_model_type='44khz',
+            eeg_in_channels=args.eeg_channels,
+            hidden_dim=args.hidden_dim, 
+            num_layers=args.num_layers,
+            backbone=args.backbone
+        ).to(device)
         
-        checkpoint_path = os.path.join(args.checkpoint_dir, "best_model.pth")
+        checkpoint_path = args.checkpoint_dir if args.checkpoint_dir.endswith('.pth') else os.path.join(args.checkpoint_dir, "best_model.pth")
+        
         if os.path.exists(checkpoint_path):
             print(f"Loading checkpoint {checkpoint_path}...")
+            # Use weights_only=False to avoid future warnings if safe, or handle pickle security
             model.load_state_dict(torch.load(checkpoint_path, map_location=device))
         else:
-            print("No checkpoint found! Running with random weights (Sanity Check).")
+            print(f"No checkpoint found at {checkpoint_path}! Running with random weights.")
             
-        criterion = nn.MSELoss()
+        # Use NeuroCodecLoss for compatibility with validate() function signature
+        criterion = NeuroCodecLoss(lambda_recon=1.0, lambda_env=0.0).to(device)
         
         val_loss, val_sisdr = validate(model, val_loader, criterion, device, args)
         print(f"Validation Result | Loss: {val_loss:.4f} | SI-SDR: {val_sisdr:.2f} dB")

@@ -1,77 +1,105 @@
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchaudio
+
+class PearsonCorrelationLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+    def forward(self, pred, target):
+        """
+        Computes Pearson Correlation Coefficient loss: 1 - PCC
+        Input shapes: (B, T) or (B, 1, T)
+        """
+        # Flatten to (B, T)
+        if pred.dim() > 2:
+            pred = pred.view(pred.shape[0], -1)
+        if target.dim() > 2:
+            target = target.view(target.shape[0], -1)
+            
+        # Center the data (subtract mean)
+        pred_mean = pred - pred.mean(dim=1, keepdim=True)
+        target_mean = target - target.mean(dim=1, keepdim=True)
+        
+        # Normalize
+        pred_norm = torch.norm(pred_mean, p=2, dim=1)
+        target_norm = torch.norm(target_mean, p=2, dim=1)
+        
+        # Compute Cosine Similarity between centered vectors (which is PCC)
+        # Avoid division by zero
+        eps = 1e-8
+        correlation = (pred_mean * target_mean).sum(dim=1) / (pred_norm * target_norm + eps)
+        
+        # Loss = 1 - Mean Correlation
+        loss = 1 - correlation.mean()
+        
+        return loss, correlation.mean()
+
+class EnvelopeMatcher(nn.Module):
+    def __init__(self, target_rate=128, audio_rate=44100):
+        super().__init__()
+        self.target_rate = target_rate
+        self.audio_rate = audio_rate
+        self.pool_kernel = int(audio_rate / target_rate)
+        
+    def extract_envelope(self, audio):
+        """
+        Extracts Amplitude Envelope from Audio and downsamples to Target Rate.
+        Audio: (B, 1, T_audio)
+        Returns: (B, T_eeg)
+        """
+        # 1. Absolute value (Rectification)
+        abs_audio = torch.abs(audio)
+        
+        # 2. Average Pooling to downsample
+        # Kernel size matches the resampling ratio
+        envelope = F.avg_pool1d(abs_audio, kernel_size=self.pool_kernel, stride=self.pool_kernel)
+        
+        # Squeeze channel dim: (B, 1, T) -> (B, T)
+        return envelope.squeeze(1)
 
 class NeuroCodecLoss(nn.Module):
-    def __init__(self, lambda_cosine=1.0, lambda_l1=0.0):
+    def __init__(self, lambda_recon=1.0, lambda_env=1.0):
         super().__init__()
-        self.lambda_cosine = lambda_cosine
-        self.lambda_l1 = lambda_l1
+        self.lambda_recon = lambda_recon
+        self.lambda_env = lambda_env
         self.mse = nn.MSELoss()
-        self.l1 = nn.L1Loss()
+        self.env_loss = PearsonCorrelationLoss()
+        self.env_extractor = EnvelopeMatcher()
         
-    def forward(self, z_pred, z_target):
-        # 1. MSE Loss (Main reconstruction)
-        loss_mse = self.mse(z_pred, z_target)
+    def forward(self, z_pred, z_target, env_pred=None, clean_audio=None):
+        """
+        z_pred: (B, 1024, T_audio_tokens)
+        z_target: (B, 1024, T_audio_tokens)
+        env_pred: (B, T_eeg) - Predicted Envelope from EEG
+        clean_audio: (B, 1, T_raw) - Ground Truth Audio
+        """
+        # 1. Reconstruction Loss (MSE on Latents)
+        loss_recon = self.mse(z_pred, z_target)
         
-        # 2. Cosine Embedding Loss (Directionality)
-        # z: (B, 1024, T)
-        # Flatten to (B*T, 1024) for cosine sim
-        z_pred_flat = z_pred.transpose(1, 2).reshape(-1, z_pred.shape[1])
-        z_target_flat = z_target.transpose(1, 2).reshape(-1, z_target.shape[1])
+        # 2. Envelope Loss (PCC on EEG -> Audio Envelope)
+        loss_env = torch.tensor(0.0, device=z_pred.device)
+        pcc_score = torch.tensor(0.0, device=z_pred.device)
         
-        # Target for CosineEmbeddingLoss is 1 (maximize similarity)
-        target_ones = torch.ones(z_pred_flat.shape[0], device=z_pred.device)
-        
-        # maximization of cosine similarity = minimization of (1 - cos)
-        loss_cos = nn.functional.cosine_embedding_loss(z_pred_flat, z_target_flat, target_ones)
-        
-        # 3. L1 Loss (optional, for sparsity/sharpness)
-        loss_l1 = 0.0
-        if self.lambda_l1 > 0:
-            loss_l1 = self.l1(z_pred, z_target)
+        if env_pred is not None and clean_audio is not None:
+            # Extract GT Envelope
+            with torch.no_grad():
+                env_gt = self.env_extractor.extract_envelope(clean_audio)
+            
+            # Ensure shapes match (handle rounding errors in length)
+            min_len = min(env_pred.shape[-1], env_gt.shape[-1])
+            env_pred = env_pred[..., :min_len]
+            env_gt = env_gt[..., :min_len]
+            
+            loss_env, pcc_score = self.env_loss(env_pred, env_gt)
             
         # Total Loss
-        total_loss = loss_mse + (self.lambda_cosine * loss_cos) + (self.lambda_l1 * loss_l1)
+        loss_total = (self.lambda_recon * loss_recon) + (self.lambda_env * loss_env)
         
-        return total_loss, {
-            "mse": loss_mse.item(),
-            "cosine": loss_cos.item(),
-            "l1": loss_l1.item() if self.lambda_l1 > 0 else 0.0
+        return loss_total, {
+            "loss_recon": loss_recon.item(),
+            "loss_env": loss_env.item(),
+            "pcc": pcc_score.item()
         }
-
-class InfoNCELoss(nn.Module):
-    def __init__(self, temperature=0.1):
-        super().__init__()
-        self.temperature = temperature
-        self.cross_entropy = nn.CrossEntropyLoss()
-        
-    def forward(self, z_pred, z_target):
-        """
-        Contrastive Loss for Temporal Alignment.
-        z_pred: (B, C, T)
-        z_target: (B, C, T)
-        """
-        # 1. Normalize Vectors (Cosine Sim requires normalization)
-        z_pred = F.normalize(z_pred, p=2, dim=1)   # (B, C, T)
-        z_target = F.normalize(z_target, p=2, dim=1) # (B, C, T)
-        
-        # 2. Permute to (B, T, C)
-        B, C, T = z_pred.shape
-        z_pred = z_pred.transpose(1, 2)   # (B, T, C)
-        z_target = z_target.transpose(1, 2) # (B, T, C)
-        
-        # 3. Compute Similarity Matrix (B, T, T)
-        # For each batch element, we compute T x T matrix
-        # logits[b, i, j] = sim(pred[b, i], target[b, j]) / temp
-        logits = torch.bmm(z_pred, z_target.transpose(1, 2)) / self.temperature
-        
-        # 4. Create Labels
-        # The correct match for Pred[t] is Target[t] (diagonal)
-        labels = torch.arange(T, device=z_pred.device).unsqueeze(0).repeat(B, 1) # (B, T)
-        
-        # 5. Flatten and Compute Loss
-        # We classify along the last dimension (Target Time steps)
-        loss = self.cross_entropy(logits.view(-1, T), labels.view(-1))
-        
-        return loss
