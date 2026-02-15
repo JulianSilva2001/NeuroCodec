@@ -325,16 +325,17 @@ def visualize(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root', type=str, default='/home/jaliya/eeg_speech/navindu/data/Cocktail_Party/Normalized-without-bad-components')
-    parser.add_argument('--checkpoint', type=str, default='checkpoints/neurocodec_v4_infonce/latest_model.pth')
+    parser.add_argument('--root', type=str, default='/home/jaliya/eeg_speech/Julian/kul_dataset_8k.lmdb')
+    parser.add_argument('--checkpoint', type=str, default='checkpoints/neurocodec/KUL/mamba/best_model.pth')
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--hidden_dim', type=int, default=256, help="Hidden dimension (default: 256)")
-    parser.add_argument('--subset', type=str, default='train', help="Dataset subset (train, val, test)")
+    parser.add_argument('--subset', type=str, default='val', help="Dataset subset (train, val, test)")
     parser.add_argument('--noise_eeg', action='store_true', help="Use random noise instead of real EEG")
     parser.add_argument('--num_samples', type=int, default=5, help="Number of samples to visualize")
-    parser.add_argument('--dataset', type=str, default='cocktail', choices=['cocktail', 'kul'], help='Dataset to use')
+    parser.add_argument('--dataset', type=str, default='kul', choices=['cocktail', 'kul'], help='Dataset to use')
     
     args = parser.parse_args()
+    
     
     # Run visualization loop
     visualize(args)

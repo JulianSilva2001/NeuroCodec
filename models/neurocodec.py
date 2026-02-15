@@ -13,16 +13,23 @@ from utility.utils import ChannelwiseLayerNorm, ResBlock, Conv1D
 
 
 # Import existing modules
+# Import existing modules
 # We redefine EEGEncoder to avoid hardcoded shapes in M3ANET.py
 from models.groupmamba import GroupMamba 
+from models.activations import Snake1d 
 
 class Chebynet(nn.Module):
-    def __init__(self, in_channel=128, k_adj=3):
+    def __init__(self, in_channel=128, k_adj=3, activation='relu'):
         super(Chebynet, self).__init__()
         self.K = k_adj
         self.gc = nn.ModuleList()
         for i in range(k_adj):
             self.gc.append(GraphConvolution(in_channel, in_channel))
+            
+        if activation == 'snake':
+            self.act = Snake1d(in_channel)
+        else:
+            self.act = nn.ReLU()
 
     def forward(self, x ,L):
         adj = generate_cheby_adj(L, self.K)
@@ -31,12 +38,12 @@ class Chebynet(nn.Module):
                 result = self.gc[i](x, adj[i])
             else:
                 result += self.gc[i](x, adj[i])
-        result = F.relu(result)
+        result = self.act(result)
         return result
 
 class FlexibleEEGEncoder(nn.Module):
     def __init__(self, num_electrodes=128, k_adj=3, enc_channel=128, feature_channel=64, kernel_size=8,
-                 norm='ln', K=160, kernel=3, stride=1): # Changed stride 4 -> 1
+                 norm='ln', K=160, kernel=3, stride=1, activation='prelu'): # Changed stride 4 -> 1
         super().__init__()
         self.stride = stride
         self.K = k_adj
@@ -44,7 +51,7 @@ class FlexibleEEGEncoder(nn.Module):
         # BN over Electrodes (Channels)
         self.BN1 = nn.BatchNorm1d(num_electrodes)
         
-        self.layer1 = Chebynet(num_electrodes, k_adj)
+        self.layer1 = Chebynet(num_electrodes, k_adj, activation=activation)
         # Stride=1 to preserve time resolution
         self.projection = nn.Conv1d(num_electrodes, feature_channel, kernel_size, bias=False, stride=self.stride)
         
@@ -61,6 +68,13 @@ class FlexibleEEGEncoder(nn.Module):
         # It has self.maxpool = nn.MaxPool1d(3).
         # We must redefine ResBlock or use a custom block here.
         
+        # Helper for activation
+        def get_activation(channels):
+            if activation == 'snake':
+                return Snake1d(channels)
+            else:
+                return nn.PReLU()
+
         # Let's use simple Conv1D blocks to keep it clean and adaptable
         self.dropout = nn.Dropout(0.3)
         self.eeg_encoder = nn.Sequential(
@@ -68,15 +82,15 @@ class FlexibleEEGEncoder(nn.Module):
             Conv1D(feature_channel, feature_channel, 1),
             # ResBlock(feature_channel, feature_channel), # Removed due to pooling
             Conv1D(feature_channel, feature_channel, 3, padding=1),
-            nn.PReLU(),
+            get_activation(feature_channel),
             self.dropout,
             # ResBlock(feature_channel, enc_channel),
             Conv1D(feature_channel, enc_channel, 3, padding=1),
-            nn.PReLU(),
+            get_activation(enc_channel),
             self.dropout,
             # ResBlock(enc_channel, enc_channel),
             Conv1D(enc_channel, enc_channel, 3, padding=1),
-            nn.PReLU(),
+            get_activation(enc_channel),
             self.dropout,
             Conv1D(enc_channel, feature_channel, 1),
         )
@@ -213,8 +227,14 @@ class NeuroCodec(nn.Module):
                  eeg_in_channels=128,
                  hidden_dim=256,
                  num_layers=4,
-                 backbone='mamba'):
+                 backbone='mamba',
+                 activation='prelu', # Default prelu for compat
+                 normalize_latents=False): 
         super().__init__()
+        
+        # Save activation choice
+        self.activation_type = activation
+        self.normalize_latents = normalize_latents
         
         # 1. Frozen DAC Backbone
         print(f"Loading Frozen DAC ({dac_model_type})...")
@@ -231,7 +251,8 @@ class NeuroCodec(nn.Module):
         self.eeg_encoder = FlexibleEEGEncoder(num_electrodes=eeg_in_channels, 
                                       enc_channel=64, 
                                       feature_channel=64, 
-                                      norm='ln')
+                                      norm='ln',
+                                      activation=activation)
 
         # 4. Input Projections
         # We project z_mix (1024) -> hidden_dim
@@ -307,6 +328,12 @@ class NeuroCodec(nn.Module):
         
         # Transpose back to (B, 1024, T) for loss/DAC
         z_pred = z_pred.transpose(1, 2)
+        
+        # Optional: L2 Normalize Latents (Euclidean -> Cosine Sim)
+        if self.normalize_latents:
+            z_pred = F.normalize(z_pred, p=2, dim=1)
+            # Also normalize target! z_mix is the target from DAC.
+            z_mix = F.normalize(z_mix, p=2, dim=1)
         
         return z_pred, codes_mix, z_mix, eeg_feat, last_attn_weights, envelope_pred
 

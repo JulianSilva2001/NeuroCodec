@@ -6,13 +6,22 @@ Unlike traditional masking approaches (e.g., DPRNN, M3ANet), NeuroCodec treats s
 It leverages a **Frozen Descript Audio Codec (DAC)** to represent audio as discrete tokens and uses a **Causal Mamba Decoder** to predict the target speech tokens from a mixture, guided by EEG signals.
 
 ![Architecture](overall.jpg)
-*(Note: Diagram placeholder - update if new diagram exists)*
+
 
 ## 🧠 Key Features
 -   **Generative Approach**: Predicts clean speech tokens directly (Latent-to-Latent).
 -   **Frozen Backbone**: Uses the high-fidelity `descript-audio-codec` (44.1kHz).
 -   **Efficient Decoder**: Causal Mamba layers for fast, streaming-compatible generation.
 -   **High-Res EEG**: Processes 128Hz EEG without downsampling.
+-   **Snake Activations**: Replaces ReLU/PReLU with the Snake function for improved waveform fidelity.
+
+## 🎵 Acoustic Guide (New)
+The model includes advanced training objectives inspired by the Descript Audio Codec (DAC) paper to ensure high-fidelity audio reconstruction:
+
+1.  **L2-Normalized Latents (Cosine Similarity)**: Forces the model to predict the *direction* of latent vectors rather than magnitude, stabilizing training.
+2.  **Multi-Scale Mel-Reconstruction Loss**: Guides the model using the actual audio waveform (decoded from latents) to improve perceptual quality.
+3.  **Adversarial Feedback (GAN)**: Uses Multi-Period (MPD), Multi-Scale (MSD), and Multi-Band (MRD) discriminators as external critics to eliminate artifacts and produce realistic speech.
+    - *Configurable via `lambda_adv` in `configs/neurocodec.yaml`.*
 
 ## 🛠️ Installation
 
@@ -56,16 +65,18 @@ data/
 ## 🚀 Usage
 
 ### 1. Training
-To train the NeuroCodec model from scratch:
+To train the NeuroCodec model (using the configuration file):
 ```bash
-python train_neurocodec.py \
-  --root /path/to/data \
-  --batch_size 16 \
-  --lr 1e-3 \
-  --epochs 50 \
-  --gpu 0
+python train_neurocodec.py --config configs/neurocodec.yaml
 ```
-Checkpoints will be saved in `checkpoints/neurocodec/`.
+Key configuration options in `configs/neurocodec.yaml`:
+-   `activation`: `'snake'` (Recommended)
+-   `normalize_latents`: `true` (Enable Cosine Similarity)
+-   `lambda_mel`: `15.0` (Enable Acoustic Guide)
+-   `lambda_adv`: `1.0` (Enable Discriminators)
+-   `batch_size`: `8` (Adjust for VRAM)
+
+Checkpoints will be saved in `checkpoints/neurocodec/KUL/mod/`.
 
 ### 2. Inference & Generation
 To generate audio from the test set:
@@ -100,6 +111,5 @@ python train_neurocodec.py --evaluate --noise_cue --gpu 0
 -   **Current Best Model**: Trained for 50 epochs on Normalized-2 dataset.
 -   **Codecs**: Uses DAC 44kHz backbone.
 
-## 🤝 Acknowledgements
-Based on the **M3ANet** architecture.
-Refactored by the DeepMind Advanced Agentic Coding Team.
+
+

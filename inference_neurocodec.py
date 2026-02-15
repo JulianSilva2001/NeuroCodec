@@ -1,5 +1,6 @@
 
 import os
+import time # Added for timing
 import argparse
 import torch
 import numpy as np
@@ -43,7 +44,14 @@ def inference(args):
         
     # 1. Load Model
     print(f"Loading Model from {args.checkpoint}...")
-    model = NeuroCodec(dac_model_type=dac_model_type, eeg_in_channels=eeg_channels, hidden_dim=args.hidden_dim).to(device)
+    model = NeuroCodec(
+        dac_model_type=dac_model_type, 
+        eeg_in_channels=eeg_channels, 
+        hidden_dim=args.hidden_dim,
+        backbone=args.backbone, # Updated
+        activation=args.activation, # Updated
+        normalize_latents=args.normalize_latents # Updated
+    ).to(device)
     
     checkpoint = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(checkpoint)
@@ -84,6 +92,10 @@ def inference(args):
         eeg = eeg.to(device)
         clean = clean.to(device)
         
+        if args.silence_audio:
+            noisy = torch.zeros_like(noisy)
+            print("  [Silence Audio] Replaced Noisy Audio with Silence (Check Leakage)")
+            
         if args.noise_cue:
             # Replace EEG with Noise matching the statistics of the real EEG
             # This ensures we test "Information Content" not "Signal Magnitude"
@@ -93,6 +105,11 @@ def inference(args):
             print(f"  [Noise Cue] Replaced EEG with Gaussian Noise (Mean: {eeg_mean:.2f}, Std: {eeg_std:.2f})")
             
         with torch.no_grad():
+            # Start Timer
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            start_time = time.time()
+            
             # Forward Pass
             output = model(noisy, eeg)
             if isinstance(output, tuple):
@@ -106,10 +123,21 @@ def inference(args):
             # Decode to Audio
             pred_audio = model.dac.decode(z_q)
             
+            # End Timer
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            end_time = time.time()
+            
+            inference_time = (end_time - start_time) * 1000 # ms
+            audio_duration = noisy.shape[-1] / target_fs
+            rtf = inference_time / (audio_duration * 1000)
+            
+            print(f"  [Latency] Inference Time: {inference_time:.2f} ms | Audio Duration: {audio_duration:.2f} s | RTF: {rtf:.4f}")
+            
         # 4. Save Audio
-        output_dir = "results/NeuroCodec_v4_infonce_best/Inference"
+        output_dir = "results/NeuroCodec_KUL_E_e12/Inference"
         if args.noise_cue:
-            output_dir = "results/NeuroCodec_v4_infonce_best/Inference_NoiseCue"
+            output_dir = "results/NeuroCodec_KUL_E_e12/noise_cue/Inference_NoiseCue"
             
         os.makedirs(output_dir, exist_ok=True)
         
@@ -215,8 +243,8 @@ def inference(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root', type=str, default='/home/jaliya/eeg_speech/navindu/data/Cocktail_Party/Normalized-without-bad-components')
-    parser.add_argument('--checkpoint', type=str, default='checkpoints/neurocodec/d2/mamba/best_model.pth')
+    parser.add_argument('--root', type=str, default='/home/jaliya/eeg_speech/Julian/kul_dataset_8k.lmdb')
+    parser.add_argument('--checkpoint', type=str, default='checkpoints/neurocodec/KUL/mamba/best_model.pth')
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--subset', type=str, default='val', help="Dataset subset to use (train, val, test)")
     parser.add_argument('--num_samples', type=int, default=10, help="Number of samples to process")
@@ -224,9 +252,14 @@ if __name__ == "__main__":
     parser.add_argument('--hidden_dim', type=int, default=256, help="Hidden dimension of the model (default: 128)")
     parser.add_argument('--use_fast_bss', action='store_true', default=True, help="Use fast_bss_eval for SIR-SDR")
     
-    parser.add_argument('--dataset', type=str, default='cocktail', choices=['cocktail', 'kul'], help='Dataset to use')
+    parser.add_argument('--backbone', type=str, default='mamba', choices=['mamba', 'transformer'], help='Backbone architecture')
+    parser.add_argument('--activation', type=str, default='prelu', choices=['prelu', 'snake'], help="Activation function")
+    parser.add_argument('--normalize_latents', type=bool, default=False, help="L2-Normalize Latents")
+    parser.add_argument('--dataset', type=str, default='kul', choices=['cocktail', 'kul'], help='Dataset to use')
     parser.add_argument('--shuffle', action='store_true', default=True, help="Shuffle the dataset to pick random samples")
+    parser.add_argument('--silence_audio', action='store_true', help="Use silence instead of noisy audio (Check Leakage)")
     
     args = parser.parse_args()
+
     
     inference(args)

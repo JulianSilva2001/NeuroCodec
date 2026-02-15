@@ -1,0 +1,32 @@
+
+# NeuroCodec Configuration
+dataset: 'kul'
+root: '/home/jaliya/eeg_speech/Julian/kul_dataset_8k.lmdb'
+
+# Model Architecture
+backbone: 'mamba'
+hidden_dim: 256
+num_layers: 4
+activation: 'snake' # Options: 'prelu', 'snake'
+normalize_latents: true # L2-Normalize latents (Euclidean -> Cosine Sim)
+eeg_channels: 64
+
+# Training Parameters
+gpu: 0
+batch_size: 8
+lr: 1e-3
+epochs: 10
+checkpoint_dir: 'checkpoints/neurocodec/KUL/mod'
+debug: false
+
+
+# Loss Weights
+lambda_recon: 1.0
+lambda_env: 0.0 # Standard PCC Loss
+lambda_mel: 15.0 # Multi-Scale Mel Reconstruction Loss Weight
+lambda_adv: 1.0 # Adversarial Loss Weight (Set to 0.0 to DISABLE Discriminator)
+lambda_feat: 2.0 # Feature Matching Loss Weight
+
+# Evaluation
+evaluate: false
+noise_cue: false
