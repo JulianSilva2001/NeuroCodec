@@ -16,32 +16,39 @@ from losses_neurocodec import NeuroCodecLoss
 
 def sisdr(reference, estimation):
     """
-    Scale-Invariant Signal-to-Distortion Ratio (SI-SDR)
+    Scale-Invariant Signal-to-Distortion Ratio (SI-SDR) with proper
+    mean removal and length alignment.
+
     Args:
         reference: numpy.ndarray, [..., T]
         estimation: numpy.ndarray, [..., T]
     Returns:
-        SI-SDR
+        SI-SDR per sample (same leading dims as inputs)
     """
-    reference_energy = np.sum(reference ** 2, axis=-1, keepdims=True)
-    
-    # This is to avoid zero energy
-    # reference_energy[reference_energy == 0] = 1e-8
+    reference = np.asarray(reference)
+    estimation = np.asarray(estimation)
+
+    # Time align (safeguard if caller didn't already crop)
+    min_len = min(reference.shape[-1], estimation.shape[-1])
+    reference = reference[..., :min_len]
+    estimation = estimation[..., :min_len]
+
+    # Remove DC offset (true scale-invariant version)
+    reference = reference - np.mean(reference, axis=-1, keepdims=True)
+    estimation = estimation - np.mean(estimation, axis=-1, keepdims=True)
+
+    ref_energy = np.sum(reference ** 2, axis=-1, keepdims=True) + 1e-8
 
     # Optimal scaling factor
-    alpha = np.sum(reference * estimation, axis=-1, keepdims=True) / (reference_energy + 1e-8)
-    
-    # Projection
-    projections = alpha * reference
-    
-    # Noise
-    noise = estimation - projections
-    
-    projections_energy = np.sum(projections ** 2, axis=-1)
-    noise_energy = np.sum(noise ** 2, axis=-1)
-    
-    si_sdr_val = 10 * np.log10(projections_energy / (noise_energy + 1e-8))
-    
+    alpha = np.sum(reference * estimation, axis=-1, keepdims=True) / ref_energy
+
+    e_true = alpha * reference
+    e_noise = estimation - e_true
+
+    si_sdr_val = 10 * np.log10(
+        np.sum(e_true ** 2, axis=-1) / (np.sum(e_noise ** 2, axis=-1) + 1e-8)
+    )
+
     return si_sdr_val
 
 def train(args):
@@ -67,6 +74,18 @@ def train(args):
         if args.eeg_channels == 128:
              print("Info: KUL dataset selected, defaulting EEG channels to 64 (overriding 128).")
              args.eeg_channels = 64
+
+        # Validate LMDB path; fall back to local default if obvious mismatch is given
+        if not os.path.exists(args.root):
+            fallback_lmdb = os.path.join(os.path.dirname(__file__), 'kul_mixcsv_16k.lmdb')
+            if os.path.exists(fallback_lmdb):
+                print(f"Warning: KUL LMDB not found at '{args.root}'. Falling back to '{fallback_lmdb}'.")
+                args.root = fallback_lmdb
+            else:
+                raise FileNotFoundError(
+                    f"KUL LMDB path '{args.root}' does not exist. "
+                    "Point --root to your KUL LMDB file (e.g., kul_mixcsv_16k.lmdb)."
+                )
         
         # Audio Configuration for KUL
         dac_model_type = '16khz'
@@ -80,13 +99,15 @@ def train(args):
             root=args.root, 
             subset='train', 
             batch_size=args.batch_size,
-            num_gpus=1
+            num_gpus=1,
+            fraction=args.fraction
         )
          val_loader = load_NeuroCodecDataset(
             root=args.root, 
             subset='val', 
             batch_size=args.batch_size, 
-            num_gpus=1
+            num_gpus=1,
+            fraction=args.fraction
         )
     elif args.dataset == 'kul':
          train_loader = load_KUL_NeuroCodecDataset(
@@ -94,14 +115,16 @@ def train(args):
             subset='train',
             batch_size=args.batch_size,
             num_gpus=1,
-            target_fs=target_fs
+            target_fs=target_fs,
+            fraction=args.fraction
          )
          val_loader = load_KUL_NeuroCodecDataset(
             lmdb_path=args.root,
             subset='val',
             batch_size=args.batch_size,
             num_gpus=1,
-            target_fs=target_fs
+            target_fs=target_fs,
+            fraction=args.fraction
          )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
@@ -142,7 +165,7 @@ def train(args):
     
     # Scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5, verbose=True
+        optimizer, mode='min', factor=0.5, patience=5
     )
     
     # 5. Training Loop
@@ -155,7 +178,9 @@ def train(args):
         current_lr = optimizer.param_groups[0]['lr']
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [LR: {current_lr:.1e}]")
         
-        for batch_idx, (noisy, eeg, clean) in enumerate(pbar):
+        for batch_idx, batch in enumerate(pbar):
+            # Support loaders that return extra length/index tensors (KUL collate_fn returns 5-6 items)
+            noisy, eeg, clean = batch[0], batch[1], batch[2]
             noisy = noisy.to(device)
             clean = clean.to(device)
             eeg = eeg.to(device)
@@ -231,7 +256,8 @@ def validate(model, loader, criterion, device, args):
     sisdr_scores = []
     
     with torch.no_grad():
-        for batch_idx, (noisy, eeg, clean) in enumerate(loader):
+        for batch_idx, batch in enumerate(loader):
+            noisy, eeg, clean = batch[0], batch[1], batch[2]
             # ... (Existing Loading & Forward) ...
             noisy = noisy.to(device)
             clean = clean.to(device)
@@ -301,8 +327,9 @@ if __name__ == "__main__":
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/neurocodec/KUL/mamba')
     parser.add_argument('--debug', action='store_true', help="Run fast debug mode")
-    parser.add_argument('--dataset', type=str, default='cocktail', choices=['cocktail', 'kul'], help='Dataset to use')
+    parser.add_argument('--dataset', type=str, default='kul', choices=['cocktail', 'kul'], help='Dataset to use')
     parser.add_argument('--eeg_channels', type=int, default=128, help='Number of EEG channels (128 for Cocktail, 64 for KUL)')
+    parser.add_argument('--fraction', type=float, default=1.0, help='Use a fraction of the dataset for quick experiments (0,1]')
     
     parser.add_argument('--evaluate', action='store_true', help="Run validation only")
     parser.add_argument('--noise_cue', action='store_true', help="Use random noise instead of EEG during validation")
@@ -323,9 +350,9 @@ if __name__ == "__main__":
         
         # Load Data
         if args.dataset == 'cocktail':
-             val_loader = load_NeuroCodecDataset(root=args.root, subset='val', batch_size=args.batch_size, num_gpus=1)
+             val_loader = load_NeuroCodecDataset(root=args.root, subset='val', batch_size=args.batch_size, num_gpus=1, fraction=args.fraction)
         elif args.dataset == 'kul':
-             val_loader = load_KUL_NeuroCodecDataset(lmdb_path=args.root, subset='val', batch_size=args.batch_size, num_gpus=1)
+             val_loader = load_KUL_NeuroCodecDataset(lmdb_path=args.root, subset='val', batch_size=args.batch_size, num_gpus=1, fraction=args.fraction)
              # args.eeg_channels should be set by user or we trust default?
              # If user didn't set, default is 128 (wrong for KUL).
              # We should probably force it here if it's default?
@@ -333,9 +360,12 @@ if __name__ == "__main__":
                  print("Warning: Dataset is KUL but eeg_channels is 128. Assuming user wants 64 (Autofix).")
                  args.eeg_channels = 64
         
+        # Match DAC to dataset (KUL=16k, Cocktail=44.1k)
+        dac_model_type = '16khz' if args.dataset == 'kul' else '44khz'
+
         # Load Model
         model = NeuroCodec(
-            dac_model_type='44khz',
+            dac_model_type=dac_model_type,
             eeg_in_channels=args.eeg_channels,
             hidden_dim=args.hidden_dim, 
             num_layers=args.num_layers,

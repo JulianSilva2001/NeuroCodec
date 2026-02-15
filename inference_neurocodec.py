@@ -50,15 +50,16 @@ def inference(args):
     model.eval()
     print("Model Loaded.")
     
-    # 2. Load Data
+    # 2. Load Data (default to test split for inference)
     if args.dataset == 'kul':
         val_loader = load_KUL_NeuroCodecDataset(
             lmdb_path=args.root, 
             subset=args.subset, 
-            batch_size=1,            
+            batch_size=1,
             num_gpus=1,
             target_fs=target_fs,
-            shuffle=args.shuffle
+            shuffle=args.shuffle,
+            fraction=args.fraction
         )
     else:
         val_loader = load_NeuroCodecDataset(
@@ -66,7 +67,8 @@ def inference(args):
             subset=args.subset, 
             batch_size=1, 
             num_gpus=1,
-            shuffle=args.shuffle
+            shuffle=args.shuffle,
+            fraction=args.fraction
         )
     
     # 3. Process Multiple Samples
@@ -75,10 +77,25 @@ def inference(args):
     for i in range(args.num_samples):
         print(f"\n--- Processing Sample {i+1}/{args.num_samples} ---")
         try:
-            noisy, eeg, clean = next(data_iter)
+            batch = next(data_iter)
         except StopIteration:
             print("No more samples in dataset.")
             break
+
+        # DataLoader output differs between datasets:
+        #  - Cocktail: (noisy, eeg, clean)
+        #  - KUL (with custom collate):
+        #       (noisy, eeg, clean, audio_len, eeg_len [, idx])
+        # Grab the first three tensors and ignore bookkeeping extras.
+        if isinstance(batch, (list, tuple)):
+            if len(batch) < 3:
+                raise ValueError(f"Unexpected batch size {len(batch)}; need at least (noisy, eeg, clean).")
+            noisy, eeg, clean = batch[0], batch[1], batch[2]
+            # Optional lengths if we ever want to trim padded batches
+            audio_lengths = batch[3] if len(batch) > 3 else None
+        else:
+            noisy, eeg, clean = batch
+            audio_lengths = None
             
         noisy = noisy.to(device)
         eeg = eeg.to(device)
@@ -105,6 +122,25 @@ def inference(args):
             
             # Decode to Audio
             pred_audio = model.dac.decode(z_q)
+
+            # Optional gain matching to combat low-amplitude predictions
+            if args.gain_mode != 'none':
+                def rms(x):
+                    return torch.sqrt(torch.mean(x ** 2) + 1e-8)
+                ref = clean if args.gain_mode == 'match_clean' else noisy
+                scale = rms(ref) / (rms(pred_audio) + 1e-8)
+                scale = torch.clamp(scale, 0.1, 10.0)  # avoid extreme boosts
+                pred_audio = pred_audio * scale
+                print(f"  [Gain] Mode: {args.gain_mode}, scale x{scale.item():.2f}")
+
+            # Force output length to match the reference audio length (avoid short predictions)
+            target_len = audio_lengths[0].item() if audio_lengths is not None else noisy.shape[-1]
+            cur_len = pred_audio.shape[-1]
+            if cur_len < target_len:
+                pad = target_len - cur_len
+                pred_audio = torch.nn.functional.pad(pred_audio, (0, pad))
+            elif cur_len > target_len:
+                pred_audio = pred_audio[..., :target_len]
             
         # 4. Save Audio
         output_dir = "results/NeuroCodec_v4_infonce_best/Inference"
@@ -113,11 +149,18 @@ def inference(args):
             
         os.makedirs(output_dir, exist_ok=True)
         
-        # Trim to shortest length
-        min_len = min(pred_audio.shape[-1], clean.shape[-1], noisy.shape[-1])
-        pred_audio = pred_audio[..., :min_len]
-        clean = clean[..., :min_len]
-        noisy = noisy[..., :min_len]
+        # Trim to shortest length (account for possible padding from collate_fn)
+        if audio_lengths is not None:
+            # Use true lengths from collate to remove DataLoader padding
+            true_len = int(audio_lengths[0].item())
+            pred_audio = pred_audio[..., :true_len]
+            clean = clean[..., :true_len]
+            noisy = noisy[..., :true_len]
+        else:
+            min_len = min(pred_audio.shape[-1], clean.shape[-1], noisy.shape[-1])
+            pred_audio = pred_audio[..., :min_len]
+            clean = clean[..., :min_len]
+            noisy = noisy[..., :min_len]
         
         torchaudio.save(f"{output_dir}/input_noisy_{i}.wav", noisy.cpu().squeeze(0), target_fs)
         torchaudio.save(f"{output_dir}/target_clean_{i}.wav", clean.cpu().squeeze(0), target_fs)
@@ -217,12 +260,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', type=str, default='/home/jaliya/eeg_speech/navindu/data/Cocktail_Party/Normalized-without-bad-components')
     parser.add_argument('--checkpoint', type=str, default='checkpoints/neurocodec/d2/mamba/best_model.pth')
-    parser.add_argument('--gpu', type=int, default=0)
-    parser.add_argument('--subset', type=str, default='val', help="Dataset subset to use (train, val, test)")
+    parser.add_argument('--gpu', type=int, default=1)
+    parser.add_argument('--subset', type=str, default='test', help="Dataset subset to use (train, val, test)")
+    parser.add_argument('--fraction', type=float, default=1.0, help='Use a fraction of the dataset for quick inference/debug (0 < f <= 1)')
     parser.add_argument('--num_samples', type=int, default=10, help="Number of samples to process")
     parser.add_argument('--noise_cue', action='store_true', help="Use random noise instead of EEG as input")
     parser.add_argument('--hidden_dim', type=int, default=256, help="Hidden dimension of the model (default: 128)")
     parser.add_argument('--use_fast_bss', action='store_true', default=True, help="Use fast_bss_eval for SIR-SDR")
+    parser.add_argument('--gain_mode', type=str, default='none', choices=['none', 'match_clean', 'match_noisy'],
+                        help="Post-decode gain: match RMS to clean or noisy to counter low amplitude predictions")
     
     parser.add_argument('--dataset', type=str, default='cocktail', choices=['cocktail', 'kul'], help='Dataset to use')
     parser.add_argument('--shuffle', action='store_true', default=True, help="Shuffle the dataset to pick random samples")

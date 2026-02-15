@@ -3,6 +3,7 @@ import h5py, os
 from torch.utils.data import Dataset
 import numpy as np
 from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm
 
 class NeuroCodecDataset(Dataset):
     def __init__(self, root, mode, subject=None):
@@ -114,11 +115,20 @@ class NeuroCodecDataset(Dataset):
         if hasattr(self, 'eeg_f') and self.eeg_f is not None:
             self.eeg_f.close()
 
-def load_NeuroCodecDataset(root, subset='train', batch_size=4, num_gpus=1, shuffle=None):
+def load_NeuroCodecDataset(root, subset='train', batch_size=4, num_gpus=1, shuffle=None, fraction=1.0):
     """
     Loader for Cocktail Party Dataset (H5)
     """
     dataset = NeuroCodecDataset(root, mode=subset)
+
+    # Optional fractional subset for quick experiments
+    if fraction is not None and fraction < 1.0:
+        total = len(dataset)
+        keep = max(1, int(total * fraction))
+        g = torch.Generator().manual_seed(42)
+        indices = torch.randperm(total, generator=g)[:keep].tolist()
+        dataset = torch.utils.data.Subset(dataset, indices)
+        print(f"Using fractional subset: {keep}/{total} samples ({fraction*100:.1f}%) for {subset}.")
     
     sampler = None
     if num_gpus > 1:
@@ -171,29 +181,83 @@ import lmdb
 import pickle
 import torchaudio
 
+def collate_pad_varlen(batch):
+    """Pad variable-length audio/EEG to max length in batch and return lengths (and optional indices)."""
+    has_idx = len(batch[0]) == 4
+    if has_idx:
+        noisy_list, eeg_list, clean_list, idx_list = zip(*batch)
+    else:
+        noisy_list, eeg_list, clean_list = zip(*batch)
+        idx_list = None
+    audio_lengths = torch.tensor([x.shape[-1] for x in noisy_list], dtype=torch.long)
+    eeg_lengths = torch.tensor([x.shape[-1] for x in eeg_list], dtype=torch.long)
+
+    max_audio = int(audio_lengths.max())
+    max_eeg = int(eeg_lengths.max())
+
+    def pad_audio(t):
+        if t.shape[-1] == max_audio:
+            return t
+        pad = max_audio - t.shape[-1]
+        return torch.nn.functional.pad(t, (0, pad))
+
+    def pad_eeg(t):
+        if t.shape[-1] == max_eeg:
+            return t
+        pad = max_eeg - t.shape[-1]
+        return torch.nn.functional.pad(t, (0, pad))
+
+    noisy = torch.stack([pad_audio(t) for t in noisy_list])
+    clean = torch.stack([pad_audio(t) for t in clean_list])
+    eeg = torch.stack([pad_eeg(t) for t in eeg_list])
+    if has_idx:
+        idx_tensor = torch.tensor(idx_list, dtype=torch.long)
+        return noisy, eeg, clean, audio_lengths, eeg_lengths, idx_tensor
+    return noisy, eeg, clean, audio_lengths, eeg_lengths
+
 class KULNeuroCodecDataset(Dataset):
-    def __init__(self, lmdb_path, indices=None, target_fs=44100, original_fs=8000):
+    def __init__(self, lmdb_path, indices=None, target_fs=16000, original_fs=16000):
         super().__init__()
         self.lmdb_path = lmdb_path
         self.indices = indices # List of LMDB keys (integers)
         self.env = None
         self.txn = None
         
-        # Resampler: 8kHz -> 44.1kHz
-        self.resampler = torchaudio.transforms.Resample(orig_freq=original_fs, new_freq=target_fs)
+        # Resampler: only create if sampling rates differ
+        self.original_fs = original_fs
+        self.target_fs = target_fs
+        self.resampler = None
+        if target_fs != original_fs:
+            self.resampler = torchaudio.transforms.Resample(orig_freq=original_fs, new_freq=target_fs)
         
-        # Open once to get length if indices not provided
+        # Open once to collect existing keys if indices not provided (robust to gaps)
         if self.indices is None:
-            temp_env = lmdb.open(self.lmdb_path, subdir=False, readonly=True, lock=False)
+            temp_env = lmdb.open(self.lmdb_path, subdir=False, readonly=True, lock=False, readahead=False)
+            keys = []
             with temp_env.begin(write=False) as txn:
-                len_bytes = txn.get(b"__len__")
-                total_len = int(len_bytes.decode("ascii")) if len_bytes else 0
+                cursor = txn.cursor()
+                for k, _ in cursor:
+                    if k == b"__len__":
+                        continue
+                    try:
+                        keys.append(int(k.decode("ascii")))
+                    except Exception:
+                        continue
             temp_env.close()
-            self.indices = list(range(total_len))
+            self.indices = sorted(keys)
             
     def _init_db(self):
-        self.env = lmdb.open(self.lmdb_path, subdir=False, readonly=True, lock=False, readahead=False, meminit=False)
+        self.env = lmdb.open(
+            self.lmdb_path,
+            subdir=False,
+            readonly=True,
+            lock=False,
+            readahead=True,   # allow OS readahead to reduce IO stalls
+            meminit=False
+        )
         self.txn = self.env.begin(write=False)
+        if self.txn is None:
+            raise RuntimeError(f"Failed to open LMDB transaction for {self.lmdb_path}")
 
     def __len__(self):
         return len(self.indices)
@@ -205,34 +269,49 @@ class KULNeuroCodecDataset(Dataset):
         real_idx = self.indices[idx]
         key = f"{real_idx}".encode("ascii")
         byteflow = self.txn.get(key)
-        
+
+        if byteflow is None:
+            raise KeyError(f"LMDB key {real_idx} missing in {self.lmdb_path} (indices may be non-contiguous or corrupted)")
+
         data = pickle.loads(byteflow)
         
         # 1. Audio (Mixture/Target) - Resample 8k -> 44.1k
-        # Data is FP16 (Usually), convert to FP32
-        mix = data['mixture'].float()   # (T,)
-        clean = data['target'].float()  # (T,)
+        # Data stored as numpy or torch; convert to torch float32
+        mix_raw = data['mixture']
+        clean_raw = data['target']
+        if hasattr(mix_raw, 'float'):
+            mix = mix_raw.float()
+        else:
+            mix = torch.from_numpy(mix_raw).float()
+        if hasattr(clean_raw, 'float'):
+            clean = clean_raw.float()
+        else:
+            clean = torch.from_numpy(clean_raw).float()
         
         # Ensure (1, T) for resampler
         if mix.ndim == 1: mix = mix.unsqueeze(0)
         if clean.ndim == 1: clean = clean.unsqueeze(0)
         
-        # Normalize Audio (KUL is unnormalized, DAC expects -1..1)
-        # Peak Normalize per sample
+        # Normalize Audio (clip-safety without altering SNR): only scale down if needed
         max_val = max(mix.abs().max(), clean.abs().max())
         if max_val > 1.0:
-            mix = mix / max_val
-            clean = clean / max_val
+            scale = max_val
+            mix = mix / scale
+            clean = clean / scale
         
-        mix_resampled = self.resampler(mix)
-        clean_resampled = self.resampler(clean)
+        if self.resampler is not None:
+            mix_resampled = self.resampler(mix)
+            clean_resampled = self.resampler(clean)
+        else:
+            mix_resampled = mix
+            clean_resampled = clean
         
         # 2. EEG
-        eeg = data['eeg'].float() # (C, T_eeg)
-        if hasattr(eeg, 'numpy'): # If it's a tensor
-             pass
-        else: 
-             eeg = torch.from_numpy(eeg).float()
+        eeg_raw = data['eeg']
+        if hasattr(eeg_raw, 'float'):
+            eeg = eeg_raw.float()
+        else:
+            eeg = torch.from_numpy(eeg_raw).float()
              
         # Normalize EEG? 
         # KUL data might be raw. NeuroCodec expects standard deviation 
@@ -240,9 +319,22 @@ class KULNeuroCodecDataset(Dataset):
         # Let's verify KUL range. Usually uV. 
         # For now return raw, user can normalize in training if needed.
         
-        return mix_resampled, eeg, clean_resampled
+        return mix_resampled, eeg, clean_resampled, real_idx
 
-def load_KUL_NeuroCodecDataset(lmdb_path, subset='train', batch_size=4, num_gpus=1, target_fs=44100, shuffle=None):
+def load_KUL_NeuroCodecDataset(
+    lmdb_path,
+    subset='train',
+    batch_size=4,
+    num_gpus=1,
+    target_fs=16000,
+    original_fs=16000,
+    shuffle=None,
+    num_workers=8,
+    prefetch_factor=4,
+    pin_memory=True,
+    persistent_workers=True,
+    fraction=1.0
+):
     """
     Loader for KUL Dataset (LMDB) with Subject-wise Splitting
     """
@@ -261,7 +353,7 @@ def load_KUL_NeuroCodecDataset(lmdb_path, subset='train', batch_size=4, num_gpus
     # For now, let's implement the 'metadata scan' approach but print progress.
     
     print(f"Scanning KUL LMDB at {lmdb_path} for splits...")
-    env = lmdb.open(lmdb_path, subdir=False, readonly=True, lock=False)
+    env = lmdb.open(lmdb_path, subdir=False, readonly=True, lock=False, readahead=False)
     with env.begin(write=False) as txn:
         len_bytes = txn.get(b"__len__")
         total_len = int(len_bytes.decode("ascii")) if len_bytes else 0
@@ -273,21 +365,31 @@ def load_KUL_NeuroCodecDataset(lmdb_path, subset='train', batch_size=4, num_gpus
             with open(cache_path, 'rb') as f:
                 subject_indices = pickle.load(f)
         else:
-            # Build Index
+            # Build Index (robust to missing/non-contiguous keys)
             subject_indices = {}
-            for i in range(total_len):
+            missing = 0
+            for i in tqdm(range(total_len), desc="Scanning LMDB splits", ncols=100):
                 key = f"{i}".encode("ascii")
+                raw = txn.get(key)
+                if raw is None:
+                    missing += 1
+                    continue
                 # We need to peek. Since pickle loads full object, this is slow.
                 # Optimization: KUL2.py saves 'subject' in top level dict.
-                data = pickle.loads(txn.get(key))
+                data = pickle.loads(raw)
                 subj = data.get('subject', 'Unknown')
+                # Normalize subject to string for consistent sorting/keys
+                if isinstance(subj, bytes):
+                    subj = subj.decode('utf-8', errors='ignore')
+                else:
+                    subj = str(subj)
                 
                 if subj not in subject_indices:
                     subject_indices[subj] = []
                 subject_indices[subj].append(i)
                 
                 if i % 100 == 0:
-                    print(f"Scanned {i}/{total_len}...", end='\r')
+                    print(f"Scanned {i}/{total_len} (missing so far: {missing})...", end='\\r')
             
             # Save Cache
             try:
@@ -303,6 +405,8 @@ def load_KUL_NeuroCodecDataset(lmdb_path, subset='train', batch_size=4, num_gpus
     # Robust numeric sort if possible (S1, S2, S10)
     def sort_key(s):
         import re
+        if not isinstance(s, str):
+            s = str(s)
         nums = re.findall(r'\d+', s)
         return int(nums[0]) if nums else s
     subjects.sort(key=sort_key)
@@ -334,7 +438,15 @@ def load_KUL_NeuroCodecDataset(lmdb_path, subset='train', batch_size=4, num_gpus
     
     print(f"Subset '{subset}': {len(target_indices)} samples (Subjects: {train_subj if subset=='train' else (val_subj if subset=='val' else test_subj)})")
     
-    dataset = KULNeuroCodecDataset(lmdb_path, indices=target_indices, target_fs=target_fs)
+    # Optional fractional subset for quick experiments (sampled deterministically)
+    if fraction is not None and fraction < 1.0:
+        total = len(target_indices)
+        keep = max(1, int(total * fraction))
+        rng = np.random.default_rng(42)
+        target_indices = rng.permutation(target_indices)[:keep].tolist()
+        print(f"Using fractional subset: {keep}/{total} samples ({fraction*100:.1f}%) for {subset}.")
+
+    dataset = KULNeuroCodecDataset(lmdb_path, indices=target_indices, target_fs=target_fs, original_fs=original_fs)
     
     sampler = None
     if num_gpus > 1:
@@ -348,8 +460,11 @@ def load_KUL_NeuroCodecDataset(lmdb_path, subset='train', batch_size=4, num_gpus
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=4,
+        num_workers=num_workers,
         sampler=sampler,
-        pin_memory=True
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers if num_workers > 0 else False,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        collate_fn=collate_pad_varlen
     )
     return loader
