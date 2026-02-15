@@ -83,7 +83,7 @@ class NeuroCodecLoss(nn.Module):
         loss_env = torch.tensor(0.0, device=z_pred.device)
         pcc_score = torch.tensor(0.0, device=z_pred.device)
         
-        if env_pred is not None and clean_audio is not None:
+        if self.lambda_env > 0 and env_pred is not None and clean_audio is not None:
             # Extract GT Envelope
             with torch.no_grad():
                 env_gt = self.env_extractor.extract_envelope(clean_audio)
