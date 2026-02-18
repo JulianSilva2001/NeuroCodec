@@ -178,9 +178,14 @@ class KULNeuroCodecDataset(Dataset):
         self.indices = indices # List of LMDB keys (integers)
         self.env = None
         self.txn = None
+        self.target_fs = target_fs
+        self.original_fs = original_fs
         
-        # Resampler: 8kHz -> 44.1kHz
-        self.resampler = torchaudio.transforms.Resample(orig_freq=original_fs, new_freq=target_fs)
+        # Resampler: original_fs -> target_fs
+        if self.original_fs != self.target_fs:
+            self.resampler = torchaudio.transforms.Resample(orig_freq=self.original_fs, new_freq=self.target_fs)
+        else:
+            self.resampler = None
         
         # Open once to get length if indices not provided
         if self.indices is None:
@@ -208,10 +213,10 @@ class KULNeuroCodecDataset(Dataset):
         
         data = pickle.loads(byteflow)
         
-        # 1. Audio (Mixture/Target) - Resample 8k -> 44.1k
+        # 1. Audio (Mixture/Target) - Resample if needed
         # Data is FP16 (Usually), convert to FP32
-        mix = data['mixture'].float()   # (T,)
-        clean = data['target'].float()  # (T,)
+        mix = torch.as_tensor(data['mixture']).float()   # (T,)
+        clean = torch.as_tensor(data['target']).float()  # (T,)
         
         # Ensure (1, T) for resampler
         if mix.ndim == 1: mix = mix.unsqueeze(0)
@@ -224,15 +229,15 @@ class KULNeuroCodecDataset(Dataset):
             mix = mix / max_val
             clean = clean / max_val
         
-        mix_resampled = self.resampler(mix)
-        clean_resampled = self.resampler(clean)
+        if self.resampler is not None:
+            mix_resampled = self.resampler(mix)
+            clean_resampled = self.resampler(clean)
+        else:
+            mix_resampled = mix
+            clean_resampled = clean
         
         # 2. EEG
-        eeg = data['eeg'].float() # (C, T_eeg)
-        if hasattr(eeg, 'numpy'): # If it's a tensor
-             pass
-        else: 
-             eeg = torch.from_numpy(eeg).float()
+        eeg = torch.as_tensor(data['eeg']).float() # (C, T_eeg)
              
         # Normalize EEG? 
         # KUL data might be raw. NeuroCodec expects standard deviation 
@@ -242,7 +247,7 @@ class KULNeuroCodecDataset(Dataset):
         
         return mix_resampled, eeg, clean_resampled
 
-def load_KUL_NeuroCodecDataset(lmdb_path, subset='train', batch_size=4, num_gpus=1, target_fs=44100, shuffle=None):
+def load_KUL_NeuroCodecDataset(lmdb_path, subset='train', batch_size=4, num_gpus=1, target_fs=44100, original_fs=16000, shuffle=None):
     """
     Loader for KUL Dataset (LMDB) with Subject-wise Splitting
     """
@@ -279,7 +284,11 @@ def load_KUL_NeuroCodecDataset(lmdb_path, subset='train', batch_size=4, num_gpus
                 key = f"{i}".encode("ascii")
                 # We need to peek. Since pickle loads full object, this is slow.
                 # Optimization: KUL2.py saves 'subject' in top level dict.
-                data = pickle.loads(txn.get(key))
+                raw_data = txn.get(key)
+                if raw_data is None:
+                    continue
+                    
+                data = pickle.loads(raw_data)
                 subj = data.get('subject', 'Unknown')
                 
                 if subj not in subject_indices:
@@ -334,7 +343,7 @@ def load_KUL_NeuroCodecDataset(lmdb_path, subset='train', batch_size=4, num_gpus
     
     print(f"Subset '{subset}': {len(target_indices)} samples (Subjects: {train_subj if subset=='train' else (val_subj if subset=='val' else test_subj)})")
     
-    dataset = KULNeuroCodecDataset(lmdb_path, indices=target_indices, target_fs=target_fs)
+    dataset = KULNeuroCodecDataset(lmdb_path, indices=target_indices, target_fs=target_fs, original_fs=original_fs)
     
     sampler = None
     if num_gpus > 1:

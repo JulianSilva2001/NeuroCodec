@@ -111,8 +111,68 @@ class FlexibleEEGEncoder(nn.Module):
 
 
 
+class Snake(nn.Module):
+    def __init__(self, dim, alpha=1.0):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(alpha)) # Scalar or Vector? Scalar for simplicity or per-channel?
+        # Standard Snake often uses per-channel frequency. Let's match input dim.
+        self.alpha = nn.Parameter(torch.ones(1, 1, dim) * alpha)
+
+    def forward(self, x):
+        # x: (B, T, D)
+        alpha = self.alpha
+        return x + (1.0 / (alpha + 1e-9)) * torch.pow(torch.sin(alpha * x), 2)
+
+class FeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim, dropout=0.0, activation='gelu'):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            self._get_activation(activation, hidden_dim),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout)
+        )
+        
+    def _get_activation(self, activation, dim):
+        if activation == 'gelu':
+            return nn.GELU()
+        elif activation == 'snake':
+            return Snake(dim)
+        elif activation == 'relu':
+            return nn.ReLU()
+        else:
+            raise ValueError(f"Unknown activation: {activation}")
+            
+    def forward(self, x):
+        return self.net(x)
+
+class TransformerBlock(nn.Module):
+    def __init__(self, hidden_dim, n_heads, dropout=0.1, activation='gelu'):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=n_heads, batch_first=True, dropout=dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        
+        self.ln2 = nn.LayerNorm(hidden_dim)
+        self.ff = FeedForward(hidden_dim, hidden_dim*4, dropout=dropout, activation=activation)
+        
+    def forward(self, x, src_mask=None, is_causal=False):
+        # x: (B, T, D)
+        # Self Attention
+        x_norm = self.ln1(x)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm, attn_mask=src_mask, is_causal=is_causal)
+        x = x + self.dropout1(attn_out)
+        
+        # Feed Forward
+        x_norm = self.ln2(x)
+        ff_out = self.ff(x_norm)
+        x = x + ff_out
+        
+        return x
+
 class NeuroCodecBlock(nn.Module):
-    def __init__(self, hidden_dim, n_heads=8, d_state=16, d_conv=4, expand=2, dropout=0.1, backbone='mamba'):
+    def __init__(self, hidden_dim, n_heads=8, d_state=16, d_conv=4, expand=2, dropout=0.1, backbone='mamba', activation='gelu'):
         super().__init__()
         self.backbone_type = backbone
         
@@ -132,16 +192,11 @@ class NeuroCodecBlock(nn.Module):
                 expand=expand
             )
         elif backbone == 'transformer':
-            # Causal Self-Attention Layer
-            # We use TransformerEncoderLayer but must ensure causal masking in forward()
-            self.core = nn.TransformerEncoderLayer(
-                d_model=hidden_dim, 
-                nhead=n_heads, 
-                dim_feedforward=hidden_dim*4, 
+            self.core = TransformerBlock(
+                hidden_dim=hidden_dim, 
+                n_heads=n_heads, 
                 dropout=dropout, 
-                activation='gelu',
-                batch_first=True,
-                norm_first=True # Pre-Norm like Mamba/GPT
+                activation=activation
             )
         else:
             raise ValueError(f"Unknown backbone: {backbone}")
@@ -164,31 +219,17 @@ class NeuroCodecBlock(nn.Module):
             x = x + self.dropout2(core_out)
             
         elif self.backbone_type == 'transformer':
-            # Manually handle residual because TransformerEncoderLayer includes it?
-            # Standard nn.TransformerEncoderLayer(x) does: x + self.dropout(self.linear2(self.dropout(self.activation(self.linear1(self.norm2(x + self.dropout(self.self_attn(self.norm1(x))...))))))
-            # Wait, if norm_first=True, it expects input x.
-            # We need to provide CURRENT sequence mask for causality.
-            
             # Generate Causal Mask
             B, T, D = x.shape
-            # mask: (T, T) - -inf above diagonal
             causal_mask = nn.Transformer.generate_square_subsequent_mask(T, device=x.device)
             
-            # Forward
-            # Note: TransformerEncoderLayer applies its own residual/norm. 
-            # If we defined it with norm_first=True, it effectively does Pre-Norm.
-            # But here we have specific structure: LN -> Core -> Add.
-            # Let's wrap it to match Mamba block structure if possible, or just use it as is.
-            # If we use nn.TransformerEncoderLayer, it IS a full block (Attn + FFN + Residuals).
-            # Mamba block is: Norm -> Mamba -> Add.
-            
-            # Let's just pass x to it, it handles residuals.
-            # But wait, Mamba is just the mixer. TransformerEncoderLayer is Mixer+MLP+Residuals.
-            # This is a slight architectural difference. Mamba also has internal gates/projections.
-            # It is comparable.
-            
+            # Custom TransformerBlock handles residuals internally, but standard convention 
+            # for this NeuroCodecBlock was explicit residual. 
+            # My TransformerBlock includes residual.
+            # But wait, self.core was TransformerEncoderLayer which includes residual.
+            # So:
             core_out = self.core(x, src_mask=causal_mask, is_causal=True)
-            x = core_out # It includes residual connection inside
+            x = core_out 
             
         return x, attn_weights
 class PositionalEncoding(nn.Module):
@@ -213,7 +254,8 @@ class NeuroCodec(nn.Module):
                  eeg_in_channels=128,
                  hidden_dim=256,
                  num_layers=4,
-                 backbone='mamba'):
+                 backbone='mamba',
+                 activation='gelu'):
         super().__init__()
         
         # 1. Frozen DAC Backbone
@@ -239,7 +281,7 @@ class NeuroCodec(nn.Module):
         
         # 5. Stacked Layers (Fusion + Generator)
         self.layers = nn.ModuleList([
-            NeuroCodecBlock(hidden_dim=hidden_dim, dropout=0.3, backbone=backbone) # Increased dropout to 0.3
+            NeuroCodecBlock(hidden_dim=hidden_dim, dropout=0.3, backbone=backbone, activation=activation) # Increased dropout to 0.3
             for _ in range(num_layers)
         ])
         

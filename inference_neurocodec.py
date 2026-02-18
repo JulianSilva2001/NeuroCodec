@@ -2,6 +2,8 @@
 import os
 import argparse
 import torch
+import time
+from tqdm import tqdm
 import numpy as np
 import scipy.signal
 import torchaudio
@@ -43,7 +45,14 @@ def inference(args):
         
     # 1. Load Model
     print(f"Loading Model from {args.checkpoint}...")
-    model = NeuroCodec(dac_model_type=dac_model_type, eeg_in_channels=eeg_channels, hidden_dim=args.hidden_dim).to(device)
+    model = NeuroCodec(
+        dac_model_type=dac_model_type, 
+        eeg_in_channels=eeg_channels, 
+        hidden_dim=args.hidden_dim, 
+        num_layers=args.num_layers,
+        backbone=args.backbone,
+        activation=args.activation
+    ).to(device)
     
     checkpoint = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(checkpoint)
@@ -58,6 +67,7 @@ def inference(args):
             batch_size=1,            
             num_gpus=1,
             target_fs=target_fs,
+            original_fs=16000,
             shuffle=args.shuffle
         )
     else:
@@ -94,7 +104,11 @@ def inference(args):
             
         with torch.no_grad():
             # Forward Pass
+            start_time = time.time()
             output = model(noisy, eeg)
+            end_time = time.time()
+            inference_time = end_time - start_time
+            
             if isinstance(output, tuple):
                 z_pred = output[0]
             else:
@@ -107,9 +121,9 @@ def inference(args):
             pred_audio = model.dac.decode(z_q)
             
         # 4. Save Audio
-        output_dir = "results/NeuroCodec_v4_infonce_best/Inference"
+        output_dir = "results/NeuroCodec_v1/last/Inference"
         if args.noise_cue:
-            output_dir = "results/NeuroCodec_v4_infonce_best/Inference_NoiseCue"
+            output_dir = "results/NeuroCodec_v1/last/Inference_NoiseCue"
             
         os.makedirs(output_dir, exist_ok=True)
         
@@ -119,9 +133,15 @@ def inference(args):
         clean = clean[..., :min_len]
         noisy = noisy[..., :min_len]
         
-        torchaudio.save(f"{output_dir}/input_noisy_{i}.wav", noisy.cpu().squeeze(0), target_fs)
-        torchaudio.save(f"{output_dir}/target_clean_{i}.wav", clean.cpu().squeeze(0), target_fs)
-        torchaudio.save(f"{output_dir}/prediction_{i}.wav", pred_audio.cpu().squeeze(0), target_fs)
+        import soundfile as sf
+        
+        # Ensure numpy format for soundfile
+        def to_numpy(t):
+            return t.detach().cpu().numpy().squeeze()
+            
+        sf.write(f"{output_dir}/input_noisy_{i}.wav", to_numpy(noisy), target_fs)
+        sf.write(f"{output_dir}/target_clean_{i}.wav", to_numpy(clean), target_fs)
+        sf.write(f"{output_dir}/prediction_{i}.wav", to_numpy(pred_audio), target_fs)
         print(f"Saved audio_{i} to {output_dir}")
         
         # 5. Calculate Metrics
@@ -171,15 +191,30 @@ def inference(args):
         clean_aligned_oracle, oracle_aligned, lag_oracle = align_signals(clean_np, clean_recon_np)
         si_sdr_oracle = sisdr(clean_aligned_oracle, oracle_aligned)
         
-        # 6. Other Metrics (on Aligned signals)
+    # 6. Other Metrics (on Aligned signals)
         # SI-SDR Input
         min_len_in = min(len(clean_np), len(noisy_np))
         si_sdr_orig = sisdr(clean_np[:min_len_in], noisy_np[:min_len_in])
         
+        # ESTOI
+        estoi_val = -1
+        try:
+            from pystoi import stoi
+            # stoi expects (clean, den, fs, extended=False)
+            fs = target_fs
+            estoi_val = stoi(clean_aligned_pred, pred_aligned, fs, extended=True)
+        except ImportError:
+            pass
+        except Exception as e:
+            print(f"ESTOI Error: {e}")
+        
         print(f"Metrics Sample {i}:")
+        print(f"  Inference Time:   {inference_time:.4f}s")
+        print(f"  Input Duration:   {noisy.shape[-1] / target_fs:.2f}s ({noisy.shape[-1]} samples)")
         print(f"  Input SI-SDR:     {si_sdr_orig:.2f} dB")
         print(f"  Oracle SI-SDR:    {si_sdr_oracle:.2f} dB (Lag: {lag_oracle})")
         print(f"  Output SI-SDR:    {si_sdr_pred:.2f} dB (Lag: {lag_pred})")
+        print(f"  Output ESTOI:     {estoi_val:.4f}")
         print(f"  Improvement:      {si_sdr_pred - si_sdr_orig:.2f} dB")
         
         # 7. Plotting (Using Aligned Signals for Prediction)
@@ -215,8 +250,8 @@ def inference(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root', type=str, default='/home/jaliya/eeg_speech/navindu/data/Cocktail_Party/Normalized-without-bad-components')
-    parser.add_argument('--checkpoint', type=str, default='checkpoints/neurocodec/d2/mamba/best_model.pth')
+    parser.add_argument('--root', type=str, default='/workspace/Dataset/kul_all_subjects.lmdb')
+    parser.add_argument('--checkpoint', type=str, default='checkpoints/neurocodec/KUL/mamba-mel/best_model.pth')
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--subset', type=str, default='val', help="Dataset subset to use (train, val, test)")
     parser.add_argument('--num_samples', type=int, default=10, help="Number of samples to process")
@@ -224,7 +259,11 @@ if __name__ == "__main__":
     parser.add_argument('--hidden_dim', type=int, default=256, help="Hidden dimension of the model (default: 128)")
     parser.add_argument('--use_fast_bss', action='store_true', default=True, help="Use fast_bss_eval for SIR-SDR")
     
-    parser.add_argument('--dataset', type=str, default='cocktail', choices=['cocktail', 'kul'], help='Dataset to use')
+    parser.add_argument('--dataset', type=str, default='kul', choices=['cocktail', 'kul'], help='Dataset to use')
+    parser.add_argument('--eeg_channels', type=int, default=64, help='Number of EEG channels (128 for Cocktail, 64 for KUL)')
+    parser.add_argument('--backbone', type=str, default='mamba', choices=['mamba', 'transformer'], help='Backbone architecture')
+    parser.add_argument('--activation', type=str, default='gelu', choices=['gelu', 'snake', 'relu'], help='Activation function (transformer only)')
+    parser.add_argument('--num_layers', type=int, default=4)
     parser.add_argument('--shuffle', action='store_true', default=True, help="Shuffle the dataset to pick random samples")
     
     args = parser.parse_args()

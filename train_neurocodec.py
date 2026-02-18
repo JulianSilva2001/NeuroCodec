@@ -12,6 +12,7 @@ import numpy as np
 # Local imports
 from models.neurocodec import NeuroCodec
 from dataset_neurocodec import load_NeuroCodecDataset, load_KUL_NeuroCodecDataset
+from losses import MelSpectrogramLoss
 from losses_neurocodec import NeuroCodecLoss
 
 def sisdr(reference, estimation):
@@ -94,26 +95,27 @@ def train(args):
             subset='train',
             batch_size=args.batch_size,
             num_gpus=1,
-            target_fs=target_fs
+            target_fs=target_fs,
+            original_fs=16000 # Correct FS
          )
          val_loader = load_KUL_NeuroCodecDataset(
             lmdb_path=args.root,
             subset='val',
             batch_size=args.batch_size,
             num_gpus=1,
-            target_fs=target_fs
+            target_fs=target_fs,
+            original_fs=16000 # Correct FS
          )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
-    # 3. Model
-    print(f"Initializing Model (DAC: {dac_model_type})...")
     model = NeuroCodec(
         dac_model_type=dac_model_type,
         eeg_in_channels=args.eeg_channels,
         hidden_dim=args.hidden_dim, # e.g. 256
         num_layers=args.num_layers,  # e.g. 4
-        backbone=args.backbone
+        backbone=args.backbone,
+        activation=args.activation
     ).to(device)
     
     if not args.debug:
@@ -139,10 +141,11 @@ def train(args):
     # Updated: Transformer Ablation (No Envelope Loss per user request)
     # lambda_env=0.0 removes PCC loss
     criterion = NeuroCodecLoss(lambda_recon=1.0, lambda_env=0.0).to(device)
+    mel_loss_fn = MelSpectrogramLoss().to(device)
     
     # Scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5, verbose=True
+        optimizer, mode='min', factor=0.5, patience=5
     )
     
     # 5. Training Loop
@@ -172,6 +175,22 @@ def train(args):
             # Updated to pass env_pred and clean audio
             loss, loss_dict = criterion(z_pred, z_target, env_pred, clean)
             
+            # Mel Spectrogram Loss
+            # Schedule: Only apply after mel_start_epoch
+            current_lambda_mel = args.lambda_mel if epoch >= args.mel_start_epoch else 0.0
+            
+            if current_lambda_mel > 0:
+                # Decode z_pred to audio
+                # DAC parameters are frozen so no gradients needed for them, 
+                # but we need gradients for z_pred.
+                pred_audio = model.dac.decode(z_pred)
+                
+                loss_mel = mel_loss_fn(pred_audio, clean)
+                loss += current_lambda_mel * loss_mel
+                loss_dict['loss_mel'] = loss_mel.item()
+            else:
+                 loss_dict['loss_mel'] = 0.0
+            
             # D. Backend
             optimizer.zero_grad()
             loss.backward()
@@ -186,7 +205,8 @@ def train(args):
                 'loss': f"{loss.item():.4f}", 
                 'mse': f"{loss_dict['loss_recon']:.4f}",
                 'env': f"{loss_dict['loss_env']:.4f}",
-                'pcc': f"{loss_dict['pcc']:.4f}"
+                'pcc': f"{loss_dict['pcc']:.4f}",
+                'mel': f"{loss_dict.get('loss_mel', 0.0):.4f}"
             })
             
             if not args.debug:
@@ -194,7 +214,9 @@ def train(args):
                     "train_loss": loss.item(),
                     "train_loss_recon": loss_dict['loss_recon'],
                     "train_loss_env": loss_dict['loss_env'],
+                    "train_loss_mel": loss_dict.get('loss_mel', 0.0),
                     "train_pcc": loss_dict['pcc'],
+                    "lambda_mel": current_lambda_mel,
                     "lr": current_lr
                 })
             
@@ -202,33 +224,60 @@ def train(args):
             if args.debug and batch_idx > 5:
                 break
                 
+        
         # Validation
-        val_loss, val_sisdr = validate(model, val_loader, criterion, device, args)
-        
-        # Step Scheduler
-        scheduler.step(val_loss)
-        
-        print(f"Epoch {epoch+1} | Train Loss: {train_loss/len(train_loader):.4f} | Val Loss: {val_loss:.4f} | Val SI-SDR: {val_sisdr:.2f} dB")
-        
-        if not args.debug:
-            wandb.log({
-                "val_loss": val_loss,
-                "val_sisdr": val_sisdr,
-                "epoch": epoch + 1
-            })
-        
-        # Save Checkpoint
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), os.path.join(args.checkpoint_dir, "best_model.pth"))
-            print("Saved Best Model.")
+        if (epoch + 1) % args.val_interval == 0:
+            val_loss, val_sisdr, val_estoi = validate(model, train_loader, criterion, device, args)
             
+            # Step Scheduler
+            scheduler.step(val_loss)
+            
+            print(f"Epoch {epoch+1} | Train Loss: {train_loss/len(train_loader):.4f} | Val Loss: {val_loss:.4f} | Val SI-SDR: {val_sisdr:.2f} dB | Val ESTOI: {val_estoi:.4f}")
+            
+            if not args.debug:
+                wandb.log({
+                    "val_loss": val_loss,
+                    "val_sisdr": val_sisdr,
+                    "val_estoi": val_estoi,
+                    "epoch": epoch + 1
+                })
+            
+            # Save Checkpoint (Best)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(model.state_dict(), os.path.join(args.checkpoint_dir, "best_model.pth"))
+                print("Saved Best Model.")
+
+        else:
+            print(f"Epoch {epoch+1} | Train Loss: {train_loss/len(train_loader):.4f} | Validation Skipped")
+            if not args.debug:
+                wandb.log({
+                    "epoch": epoch + 1
+                })
+        
+        # Save Latest Checkpoint (Every Epoch)
         torch.save(model.state_dict(), os.path.join(args.checkpoint_dir, "latest_model.pth"))
 
 def validate(model, loader, criterion, device, args):
     model.eval()
     total_loss = 0.0
     sisdr_scores = []
+    estoi_scores = []
+    
+    # Import for metrics
+    from scipy import signal
+    try:
+        from pystoi import stoi
+    except ImportError:
+        stoi = None
+    estoi_scores = []
+    
+    # Import for metrics
+    from scipy import signal
+    try:
+        from pystoi import stoi
+    except ImportError:
+        stoi = None
     
     with torch.no_grad():
         for batch_idx, (noisy, eeg, clean) in enumerate(loader):
@@ -279,35 +328,82 @@ def validate(model, loader, criterion, device, args):
             pred_np = pred_audio.cpu().numpy().squeeze(1)
             clean_np = clean_ref.cpu().numpy().squeeze(1)
             
-            scores = sisdr(clean_np, pred_np)
-            sisdr_scores.extend(scores)
+            # Handle Batch Dim if needed
+            if pred_np.ndim == 1:
+                pred_np = pred_np[np.newaxis, :]
+                clean_np = clean_np[np.newaxis, :]
+            
+            batch_sisdr = []
+            batch_estoi = []
+            
+            for b in range(pred_np.shape[0]):
+                p = pred_np[b]
+                c = clean_np[b]
+                
+                # Align
+                correlation = signal.correlate(c, p, mode='full')
+                lags = signal.correlation_lags(c.size, p.size, mode='full')
+                lag = lags[np.argmax(correlation)]
+                
+                if lag > 0:
+                    p_aligned = np.roll(p, shift=lag)
+                    p_aligned[:lag] = 0
+                elif lag < 0:
+                    p_aligned = np.roll(p, shift=lag)
+                    p_aligned[lag:] = 0
+                else:
+                    p_aligned = p
+                
+                # SI-SDR
+                score = sisdr(c, p_aligned)
+                batch_sisdr.append(score)
+                
+                # ESTOI
+                if stoi is not None:
+                    # KUL: 16000, Cocktail: 44100
+                    if args.dataset == 'kul': fs = 16000
+                    else: fs = 44100
+                    
+                    try:
+                        e_val = stoi(c, p_aligned, fs, extended=True)
+                        batch_estoi.append(e_val)
+                    except Exception:
+                        pass
+            
+            sisdr_scores.extend(batch_sisdr)
+            estoi_scores.extend(batch_estoi)
 
             if args.debug and batch_idx > 2:
                 break
                 
     mean_loss = total_loss / len(loader)
     mean_sisdr = np.mean(sisdr_scores) if len(sisdr_scores) > 0 else 0.0
+    mean_estoi = np.mean(estoi_scores) if len(estoi_scores) > 0 else 0.0
     
-    return mean_loss, mean_sisdr
+    return mean_loss, mean_sisdr, mean_estoi
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root', type=str, default='/home/jaliya/eeg_speech/navindu/data/Cocktail_Party/Normalized-1')
+    parser.add_argument('--root', type=str, default='/workspace/Dataset/kul_all_subjects.lmdb')
     parser.add_argument('--batch_size', type=int, default=16)
-    parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--epochs', type=int, default=10)
-    parser.add_argument('--hidden_dim', type=int, default=256)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--hidden_dim', type=int, default=256) 
     parser.add_argument('--num_layers', type=int, default=4)
     parser.add_argument('--gpu', type=int, default=0)
-    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/neurocodec/KUL/mamba')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/neurocodec/KUL/mamba-mel')
     parser.add_argument('--debug', action='store_true', help="Run fast debug mode")
-    parser.add_argument('--dataset', type=str, default='cocktail', choices=['cocktail', 'kul'], help='Dataset to use')
-    parser.add_argument('--eeg_channels', type=int, default=128, help='Number of EEG channels (128 for Cocktail, 64 for KUL)')
+    parser.add_argument('--dataset', type=str, default='kul', choices=['cocktail', 'kul'], help='Dataset to use')
+    parser.add_argument('--eeg_channels', type=int, default=64, help='Number of EEG channels (128 for Cocktail, 64 for KUL)')
     
     parser.add_argument('--evaluate', action='store_true', help="Run validation only")
     parser.add_argument('--noise_cue', action='store_true', help="Use random noise instead of EEG during validation")
     
     parser.add_argument('--backbone', type=str, default='mamba', choices=['mamba', 'transformer'], help='Backbone architecture')
+    parser.add_argument('--activation', type=str, default='gelu', choices=['gelu', 'snake', 'relu'], help='Activation function (transformer only)')
+    parser.add_argument('--val_interval', type=int, default=1, help="Validation interval in epochs (default: 1)")
+    parser.add_argument('--lambda_mel', type=float, default=10.0, help="Weight for Mel Spectrogram Loss")
+    parser.add_argument('--mel_start_epoch', type=int, default=0, help="Epoch to start applying Mel Loss")
     
     args = parser.parse_args()
     
@@ -325,7 +421,14 @@ if __name__ == "__main__":
         if args.dataset == 'cocktail':
              val_loader = load_NeuroCodecDataset(root=args.root, subset='val', batch_size=args.batch_size, num_gpus=1)
         elif args.dataset == 'kul':
-             val_loader = load_KUL_NeuroCodecDataset(lmdb_path=args.root, subset='val', batch_size=args.batch_size, num_gpus=1)
+             val_loader = load_KUL_NeuroCodecDataset(
+                lmdb_path=args.root, 
+                subset='val', 
+                batch_size=args.batch_size, 
+                num_gpus=1, 
+                target_fs=16000, # Hardcoded or use args
+                original_fs=16000 # Correct FS
+             )
              # args.eeg_channels should be set by user or we trust default?
              # If user didn't set, default is 128 (wrong for KUL).
              # We should probably force it here if it's default?
@@ -333,9 +436,12 @@ if __name__ == "__main__":
                  print("Warning: Dataset is KUL but eeg_channels is 128. Assuming user wants 64 (Autofix).")
                  args.eeg_channels = 64
         
+        # Determine DAC type
+        dac_type = '16khz' if args.dataset == 'kul' else '44khz'
+        
         # Load Model
         model = NeuroCodec(
-            dac_model_type='44khz',
+            dac_model_type=dac_type,
             eeg_in_channels=args.eeg_channels,
             hidden_dim=args.hidden_dim, 
             num_layers=args.num_layers,
@@ -354,8 +460,8 @@ if __name__ == "__main__":
         # Use NeuroCodecLoss for compatibility with validate() function signature
         criterion = NeuroCodecLoss(lambda_recon=1.0, lambda_env=0.0).to(device)
         
-        val_loss, val_sisdr = validate(model, val_loader, criterion, device, args)
-        print(f"Validation Result | Loss: {val_loss:.4f} | SI-SDR: {val_sisdr:.2f} dB")
+        val_loss, val_sisdr, val_estoi = validate(model, val_loader, criterion, device, args)
+        print(f"Validation Result | Loss: {val_loss:.4f} | SI-SDR: {val_sisdr:.2f} dB | ESTOI: {val_estoi:.4f}")
         
     else:
         train(args)
