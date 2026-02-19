@@ -1,6 +1,13 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch import nn
 import torchaudio
+
+from audiotools import AudioSignal
+from audiotools import STFTParams
+
+import dac.model.discriminator
 
 class MelSpectrogramLoss(nn.Module):
     """
@@ -57,46 +64,33 @@ class MelSpectrogramLoss(nn.Module):
         #
         # Or just follow DAC pattern but ensure n_mels <= n_fft/2 + 1.
         
-        self.configs = []
+        if not isinstance(n_mels, list):
+            n_mels = [n_mels] * len(window_lengths)
+            
         if len(n_mels) != len(window_lengths):
-             # Fallback or simple logic. 
-             # Let's define specific robust scales for 16k if defaults are passed.
-             pass
+            raise ValueError("n_mels list must match window_lengths list length")
 
-        # Using explicit robust defaults for 16kHz if passed args match "DAC-like" placeholder
-        # But to respect constructor args, I will implement flexible logic.
-        
-        # Logic: Create a transform for each window_length, cycling n_mels if needed.
-        
-        # Actually, let's implement exactly what was in the plan/DAC logic:
-        # "zip(n_mels, ... stft_params)"
-        # So we need len(n_mels) == len(window_lengths).
-        
-        # Let's align with 2 scales like DAC default [2048, 512].
-        # And n_mels [80, 80] or similar.
-        
-        # I will support arbitrary list of transforms.
-        
-        for win_len in window_lengths:
+        for i, win_len in enumerate(window_lengths):
             hop = win_len // 4 if hop_lengths is None else hop_lengths
             
-            # Use 80 n_mels for all scales by default if n_mels is int
-            # If list, try to zip. 
-            
-            # Let's simplify: Just create multiple transforms.
-            # We want to capture both fine and coarse detail.
+            # Safety check for n_mels vs n_fft
+            # n_fft = win_len
+            n_fft = win_len
+            max_mels = n_fft // 2 + 1
+            current_n_mels = min(n_mels[i], max_mels)
+            if current_n_mels != n_mels[i]:
+                print(f"Warning: n_mels={n_mels[i]} too large for win_len={win_len}. Clamping to {current_n_mels}.")
             
             t = torchaudio.transforms.MelSpectrogram(
                 sample_rate=sample_rate,
-                n_fft=win_len,
+                n_fft=n_fft,
                 win_length=win_len,
                 hop_length=hop,
                 center=True,
                 pad_mode="reflect",
                 power=2.0,
                 norm='slaney',
-                # n_mels needs to be set. 
-                n_mels=80, # Defaulting to 80 for all scales is safe for 16k
+                n_mels=current_n_mels,
                 f_min=f_min,
                 f_max=f_max,
                 mel_scale="htk",
@@ -128,3 +122,54 @@ class MelSpectrogramLoss(nn.Module):
             loss += self.loss_fn(pred_log, target_log)
             
         return loss / len(self.transforms)
+
+
+class GANLoss(nn.Module):
+    """
+    Computes a discriminator loss, given a discriminator on
+    generated waveforms/spectrograms compared to ground truth
+    waveforms/spectrograms. Computes the loss for both the
+    discriminator and the generator in separate functions.
+    Adapted from Descript Audio Codec.
+    """
+
+    def __init__(self, discriminator):
+        super().__init__()
+        self.discriminator = discriminator
+
+    def forward(self, fake, real):
+        # inputs are (B, 1, T) or (B, T)
+        # DAC discriminator expects (B, 1, T) usually
+        if fake.dim() == 2:
+            fake = fake.unsqueeze(1)
+        if real.dim() == 2:
+            real = real.unsqueeze(1)
+        
+        d_fake = self.discriminator(fake)
+        d_real = self.discriminator(real)
+        return d_fake, d_real
+
+    def discriminator_loss(self, fake, real):
+        d_fake, d_real = self.forward(fake.clone().detach(), real)
+
+        loss_d = 0
+        for x_fake, x_real in zip(d_fake, d_real):
+            # LSGAN: Real -> 1, Fake -> 0
+            loss_d += torch.mean(x_fake[-1] ** 2)
+            loss_d += torch.mean((1 - x_real[-1]) ** 2)
+        return loss_d
+
+    def generator_loss(self, fake, real):
+        d_fake, d_real = self.forward(fake, real)
+
+        loss_g = 0
+        for x_fake in d_fake:
+            # LSGAN: Fake -> 1
+            loss_g += torch.mean((1 - x_fake[-1]) ** 2)
+
+        loss_feature = 0
+
+        for i in range(len(d_fake)):
+            for j in range(len(d_fake[i]) - 1):
+                loss_feature += F.l1_loss(d_fake[i][j], d_real[i][j].detach())
+        return loss_g, loss_feature

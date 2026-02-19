@@ -8,12 +8,14 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import wandb
 import numpy as np
+import dac.model # Added this import
 
 # Local imports
 from models.neurocodec import NeuroCodec
 from dataset_neurocodec import load_NeuroCodecDataset, load_KUL_NeuroCodecDataset
-from losses import MelSpectrogramLoss
-from losses_neurocodec import NeuroCodecLoss
+# Consolidated and updated imports from 'losses' and 'losses_neurocodec'
+from losses import MelSpectrogramLoss, GANLoss # Added GANLoss
+from losses_neurocodec import NeuroCodecLoss # Kept this as it was in the original code
 
 def sisdr(reference, estimation):
     """
@@ -141,11 +143,28 @@ def train(args):
     # Updated: Transformer Ablation (No Envelope Loss per user request)
     # lambda_env=0.0 removes PCC loss
     criterion = NeuroCodecLoss(lambda_recon=1.0, lambda_env=0.0).to(device)
-    mel_loss_fn = MelSpectrogramLoss().to(device)
+    mel_loss_fn = MelSpectrogramLoss(
+        sample_rate=16000,
+        window_lengths=[1024, 512, 256, 128],
+        n_mels=[80, 80, 32, 16],
+        f_max=4000
+    ).to(device)
     
-    # Scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5
+    # GAN Setup
+    discriminator = dac.model.Discriminator(sample_rate=16000).to(device)
+    gan_loss_fn = GANLoss(discriminator).to(device)
+    
+    # Optimizers
+    # Generator Optimizer (NeuroCodec)
+    optimizer_g = optim.AdamW(model.parameters(), lr=args.lr, betas=(0.5, 0.9))
+    scheduler_g = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer_g, mode='min', factor=0.5, patience=5
+    )
+    
+    # Discriminator Optimizer
+    optimizer_d = optim.AdamW(discriminator.parameters(), lr=args.lr, betas=(0.5, 0.9))
+    scheduler_d = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer_d, mode='min', factor=0.5, patience=5
     )
     
     # 5. Training Loop
@@ -153,72 +172,148 @@ def train(args):
     
     for epoch in range(args.epochs):
         model.train()
-        train_loss = 0.0
+        discriminator.train()
+        total_loss = 0
+        total_g_loss = 0
+        total_d_loss = 0
         
-        current_lr = optimizer.param_groups[0]['lr']
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [LR: {current_lr:.1e}]")
+        # Determine when to start GAN training
+        use_gan = epoch >= args.gan_start_epoch
+        
+        current_lr_g = optimizer_g.param_groups[0]['lr']
+        current_lr_d = optimizer_d.param_groups[0]['lr']
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [LR_G: {current_lr_g:.1e}, LR_D: {current_lr_d:.1e}]")
         
         for batch_idx, (noisy, eeg, clean) in enumerate(pbar):
             noisy = noisy.to(device)
             clean = clean.to(device)
             eeg = eeg.to(device)
-            
-            # A. Get Target Latents (Ground Truth Z)
+
+            if args.noise_cue:
+                # Replace EEG with Gaussian Noise matching statistics
+                eeg_mean = eeg.mean()
+                eeg_std = eeg.std()
+                eeg = torch.randn_like(eeg) * eeg_std + eeg_mean
+                
+            # --- Generator Forward ---
+            # 1. Encode Target (for Recon Loss)
             with torch.no_grad():
                 z_target, _, _, _, _ = model.dac.encode(clean)
-                
-            # B. Forward Pass
-            # Updated to unpack env_pred
+            
+            # 2. Model Forward
             z_pred, _, _, _, _, env_pred = model(noisy, eeg)
             
-            # C. Compute Loss
-            # Updated to pass env_pred and clean audio
-            loss, loss_dict = criterion(z_pred, z_target, env_pred, clean)
+            # Decode for GAN / Mel Loss (Using Gumbel Softmax or Straight Through in Quantizer inside DAC?)
+            # DAC encode returns z, codes, latents, etc. 
+            # We need differentiable audio for GAN.
+            # model.dac.decode(z_pred) should be differentiable if z_pred is differentiable.
+            # But z_pred usually goes through quantizer.
+            # Let's assume model(noisy, eeg) returns 'z_pred' which is the predicted latent.
+            # We need to pass this through DAC's quantizer (straight-through) and decoder.
             
-            # Mel Spectrogram Loss
-            # Schedule: Only apply after mel_start_epoch
-            current_lambda_mel = args.lambda_mel if epoch >= args.mel_start_epoch else 0.0
+            # DAC Quantizer
+            # The quantizer returns (z_q, codes, latents, bandwidth, commit_loss)
+            z_q, _, _, _, _ = model.dac.quantizer(z_pred, n_quantizers=9) # Use 9 quantizers as in validate
             
-            if current_lambda_mel > 0:
-                # Decode z_pred to audio
-                # DAC parameters are frozen so no gradients needed for them, 
-                # but we need gradients for z_pred.
-                pred_audio = model.dac.decode(z_pred)
-                
-                loss_mel = mel_loss_fn(pred_audio, clean)
-                loss += current_lambda_mel * loss_mel
-                loss_dict['loss_mel'] = loss_mel.item()
+            # Decode
+            pred_audio = model.dac.decode(z_q)
+            
+            # Align lengths (pred_audio might be slightly longer/shorter due to padding/striding)
+            min_len = min(pred_audio.shape[-1], clean.shape[-1])
+            pred_audio = pred_audio[..., :min_len]
+            clean_aligned = clean[..., :min_len]
+            
+            # --- Discriminator Step ---
+            if use_gan:
+                optimizer_d.zero_grad()
+                d_loss = gan_loss_fn.discriminator_loss(pred_audio.detach(), clean_aligned)
+                d_loss.backward()
+                optimizer_d.step()
+                total_d_loss += d_loss.item()
             else:
-                 loss_dict['loss_mel'] = 0.0
+                d_loss = torch.tensor(0.0)
+
+            # --- Generator Step ---
+            # Update Generator only if not in warmup
+            train_generator = epoch >= args.disc_warmup_epochs
             
-            # D. Backend
-            optimizer.zero_grad()
-            loss.backward()
+            optimizer_g.zero_grad()
             
-            # Gradient Clipping (Prevent Explosion)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if train_generator:
+                # 1. Reconstruction Losses (MSE, Env, PCC)
+                recon_loss, loss_dict = criterion(z_pred, z_target, env_pred, clean)
+                
+                # 2. Mel Spectrogram Loss
+                if epoch >= args.mel_start_epoch:
+                    mel_loss = mel_loss_fn(pred_audio, clean_aligned)
+                    recon_loss += args.lambda_mel * mel_loss
+                    loss_dict['loss_mel'] = mel_loss.item()
+                else:
+                    loss_dict['loss_mel'] = 0.0
+                
+                # 3. GAN Generator Loss
+                if use_gan:
+                    g_loss_adv, g_loss_feat = gan_loss_fn.generator_loss(pred_audio, clean_aligned)
+                    gan_term = args.lambda_gan * g_loss_adv + args.lambda_feat * g_loss_feat
+                    recon_loss += gan_term
+                    loss_dict['loss_adv'] = g_loss_adv.item()
+                    loss_dict['loss_feat'] = g_loss_feat.item()
+                    total_g_loss += g_loss_adv.item() + g_loss_feat.item() 
+                
+                recon_loss.backward()
+                # Gradient Clipping (Prevent Explosion) for Generator
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer_g.step()
+                
+                total_loss += recon_loss.item()
+                log_recon_loss = recon_loss.item()
+            else:
+                # Generator Frozen: Calculate loss for logging but don't backward
+                with torch.no_grad():
+                     recon_loss, loss_dict = criterion(z_pred, z_target, env_pred, clean)
+                     log_recon_loss = recon_loss.item()
+                     loss_dict['loss_mel'] = 0.0
+                     if use_gan: # Log what G loss would be
+                        g_loss_adv, g_loss_feat = gan_loss_fn.generator_loss(pred_audio, clean_aligned)
+                        loss_dict['loss_adv'] = g_loss_adv.item()
+                        loss_dict['loss_feat'] = g_loss_feat.item()
             
-            optimizer.step()
-            
-            train_loss += loss.item()
-            pbar.set_postfix({
-                'loss': f"{loss.item():.4f}", 
+            # Logging
+            postfix = {
+                'loss': f"{log_recon_loss:.4f}", 
                 'mse': f"{loss_dict['loss_recon']:.4f}",
-                'env': f"{loss_dict['loss_env']:.4f}",
-                'pcc': f"{loss_dict['pcc']:.4f}",
-                'mel': f"{loss_dict.get('loss_mel', 0.0):.4f}"
-            })
+            }
+            if not train_generator:
+                postfix['WARMUP'] = "D_ONLY"
+                # 'env': f"{loss_dict.get('loss_env', 0):.4f}", # Removed env
+            if 'loss_mel' in loss_dict:
+                postfix['mel'] = f"{loss_dict['loss_mel']:.4f}"
+            if use_gan:
+                postfix['d_loss'] = f"{d_loss.item():.4f}"
+                postfix['g_adv'] = f"{loss_dict['loss_adv']:.4f}"
+                postfix['g_feat'] = f"{loss_dict['loss_feat']:.4f}"
+                
+            pbar.set_postfix(postfix)
             
             if not args.debug:
-                wandb.log({
-                    "train_loss": loss.item(),
+                log_dict = {
+                    "train_loss": recon_loss.item(),
                     "train_loss_recon": loss_dict['loss_recon'],
-                    "train_loss_env": loss_dict['loss_env'],
-                    "train_loss_mel": loss_dict.get('loss_mel', 0.0),
-                    "train_pcc": loss_dict['pcc'],
-                    "lambda_mel": current_lambda_mel,
-                    "lr": current_lr
-                })
+                    "train_loss_env": loss_dict.get('loss_env', 0.0), # Use get
+                    "train_pcc": loss_dict.get('pcc', 0.0), # Use get
+                    "lr_g": current_lr_g,
+                    "lr_d": current_lr_d
+                }
+                if 'loss_mel' in loss_dict:
+                    log_dict['train_loss_mel'] = loss_dict['loss_mel']
+                    log_dict['lambda_mel'] = args.lambda_mel
+                
+                if use_gan:
+                    log_dict['train_loss_adv'] = loss_dict['loss_adv']
+                    log_dict['train_loss_feat'] = loss_dict['loss_feat']
+                    log_dict['train_loss_d'] = d_loss.item()
+                    
+                wandb.log(log_dict)
             
             # Optional: Overfit check (break early)
             if args.debug and batch_idx > 5:
@@ -229,10 +324,11 @@ def train(args):
         if (epoch + 1) % args.val_interval == 0:
             val_loss, val_sisdr, val_estoi = validate(model, train_loader, criterion, device, args)
             
-            # Step Scheduler
-            scheduler.step(val_loss)
+            # Step Schedulers
+            scheduler_g.step(val_loss)
+            scheduler_d.step(val_loss)
             
-            print(f"Epoch {epoch+1} | Train Loss: {train_loss/len(train_loader):.4f} | Val Loss: {val_loss:.4f} | Val SI-SDR: {val_sisdr:.2f} dB | Val ESTOI: {val_estoi:.4f}")
+            print(f"Epoch {epoch+1} | Train Loss: {total_loss/len(train_loader):.4f} | Val Loss: {val_loss:.4f} | Val SI-SDR: {val_sisdr:.2f} dB | Val ESTOI: {val_estoi:.4f}")
             
             if not args.debug:
                 wandb.log({
@@ -249,7 +345,7 @@ def train(args):
                 print("Saved Best Model.")
 
         else:
-            print(f"Epoch {epoch+1} | Train Loss: {train_loss/len(train_loader):.4f} | Validation Skipped")
+            print(f"Epoch {epoch+1} | Train Loss: {total_loss/len(train_loader):.4f} | Validation Skipped")
             if not args.debug:
                 wandb.log({
                     "epoch": epoch + 1
@@ -291,6 +387,9 @@ def validate(model, loader, criterion, device, args):
                 eeg_mean = eeg.mean()
                 eeg_std = eeg.std()
                 eeg = torch.randn_like(eeg) * eeg_std + eeg_mean
+            
+            if args.val_batches > 0 and batch_idx >= args.val_batches:
+                break
             
             # 1. Encode Target
             z_target, _, _, _, _ = model.dac.encode(clean)
@@ -385,13 +484,13 @@ def validate(model, loader, criterion, device, args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', type=str, default='/workspace/Dataset/kul_all_subjects.lmdb')
-    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--hidden_dim', type=int, default=256) 
     parser.add_argument('--num_layers', type=int, default=4)
     parser.add_argument('--gpu', type=int, default=0)
-    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/neurocodec/KUL/mamba-mel')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/neurocodec/KUL/mamba-GAN')
     parser.add_argument('--debug', action='store_true', help="Run fast debug mode")
     parser.add_argument('--dataset', type=str, default='kul', choices=['cocktail', 'kul'], help='Dataset to use')
     parser.add_argument('--eeg_channels', type=int, default=64, help='Number of EEG channels (128 for Cocktail, 64 for KUL)')
@@ -401,9 +500,15 @@ if __name__ == "__main__":
     
     parser.add_argument('--backbone', type=str, default='mamba', choices=['mamba', 'transformer'], help='Backbone architecture')
     parser.add_argument('--activation', type=str, default='gelu', choices=['gelu', 'snake', 'relu'], help='Activation function (transformer only)')
-    parser.add_argument('--val_interval', type=int, default=1, help="Validation interval in epochs (default: 1)")
-    parser.add_argument('--lambda_mel', type=float, default=10.0, help="Weight for Mel Spectrogram Loss")
+    parser.add_argument('--val_interval', type=int, default=2, help="Validation interval in epochs (default: 1)")
+    parser.add_argument('--lambda_mel', type=float, default=13.0, help="Weight for Mel Spectrogram Loss")
     parser.add_argument('--mel_start_epoch', type=int, default=0, help="Epoch to start applying Mel Loss")
+    parser.add_argument('--val_batches', type=int, default=0, help="Limit number of validation batches (0 = full)")
+    
+    parser.add_argument('--lambda_gan', type=float, default=1.0, help="Weight for GAN Adversarial Loss")
+    parser.add_argument('--lambda_feat', type=float, default=2.0, help="Weight for GAN Feature Matching Loss")
+    parser.add_argument('--gan_start_epoch', type=int, default=0, help="Epoch to start GAN training")
+    parser.add_argument('--disc_warmup_epochs', type=int, default=3, help="Number of epochs to freeze Generator for Discriminator warmup")
     
     args = parser.parse_args()
     

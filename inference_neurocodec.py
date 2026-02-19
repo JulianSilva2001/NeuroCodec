@@ -189,26 +189,50 @@ def inference(args):
             clean_recon_np = clean_recon.cpu().numpy().squeeze()
             
         clean_aligned_oracle, oracle_aligned, lag_oracle = align_signals(clean_np, clean_recon_np)
-        si_sdr_oracle = sisdr(clean_aligned_oracle, oracle_aligned)
         
-    # 6. Other Metrics (on Aligned signals)
-        # SI-SDR Input
-        min_len_in = min(len(clean_np), len(noisy_np))
-        si_sdr_orig = sisdr(clean_np[:min_len_in], noisy_np[:min_len_in])
+        # 6. Other Metrics (on Aligned signals)
+        
+        # Band-limited Filtering (0-4kHz) for Metrics
+        def lowpass_filter(audio, cutoff=4000, fs=16000, order=5):
+            nyquist = 0.5 * fs
+            normal_cutoff = cutoff / nyquist
+            b, a = scipy.signal.butter(order, normal_cutoff, btype='low', analog=False)
+            # Use filtfilt for zero-phase filtering
+            filtered = scipy.signal.filtfilt(b, a, audio)
+            return filtered
+
+        # Filter original clean/noisy for input metrics
+        noisy_filt = lowpass_filter(noisy_np, fs=target_fs)
+        clean_filt = lowpass_filter(clean_np, fs=target_fs)
+        
+        # Filter aligned prediction/clean for output metrics
+        pred_aligned_filt = lowpass_filter(pred_aligned, fs=target_fs)
+        clean_aligned_pred_filt = lowpass_filter(clean_aligned_pred, fs=target_fs)
+        
+        # Filter oracle
+        oracle_aligned_filt = lowpass_filter(oracle_aligned, fs=target_fs)
+        clean_aligned_oracle_filt = lowpass_filter(clean_aligned_oracle, fs=target_fs)
+
+        # SI-SDR Input (Filtered)
+        min_len_in = min(len(clean_filt), len(noisy_filt))
+        si_sdr_orig = sisdr(clean_filt[:min_len_in], noisy_filt[:min_len_in])
         
         # ESTOI
         estoi_val = -1
         try:
             from pystoi import stoi
-            # stoi expects (clean, den, fs, extended=False)
-            fs = target_fs
-            estoi_val = stoi(clean_aligned_pred, pred_aligned, fs, extended=True)
+            # Use filtered signals for ESTOI as well? Yes, user requested 4kHz limit.
+            estoi_val = stoi(clean_aligned_pred_filt, pred_aligned_filt, target_fs, extended=True)
         except ImportError:
             pass
         except Exception as e:
             print(f"ESTOI Error: {e}")
         
-        print(f"Metrics Sample {i}:")
+        # Calculate Output Metrics (Filtered)
+        si_sdr_pred = sisdr(clean_aligned_pred_filt, pred_aligned_filt)
+        si_sdr_oracle = sisdr(clean_aligned_oracle_filt, oracle_aligned_filt)
+
+        print(f"Metrics Sample {i} (0-4kHz Band-limited):")
         print(f"  Inference Time:   {inference_time:.4f}s")
         print(f"  Input Duration:   {noisy.shape[-1] / target_fs:.2f}s ({noisy.shape[-1]} samples)")
         print(f"  Input SI-SDR:     {si_sdr_orig:.2f} dB")
@@ -217,41 +241,48 @@ def inference(args):
         print(f"  Output ESTOI:     {estoi_val:.4f}")
         print(f"  Improvement:      {si_sdr_pred - si_sdr_orig:.2f} dB")
         
-        # 7. Plotting (Using Aligned Signals for Prediction)
+        
+        # 6.5 Calculate Filtered Interferer
+        # Re-calc matches lengths of filtered signals
+        min_len_filt = min(len(noisy_filt), len(clean_filt))
+        interferer_filt = noisy_filt[:min_len_filt] - clean_filt[:min_len_filt]
+
+        # 7. Plotting (Using Filtered Signals)
         import matplotlib.pyplot as plt
+        import librosa.display
         
-        plt.figure(figsize=(12, 12))
+        fig, ax = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
         
-        def plot_waveform_spectrogram(audio, title, idx):
-            # Waveform
-            plt.subplot(3, 2, 2*idx + 1)
-            plt.plot(audio)
-            plt.title(f"{title} Waveform")
-            plt.grid(True, alpha=0.3)
-            # plt.ylim(-1, 1) # Auto-scale might be better if levels differ
-            
-            # Spectrogram
-            plt.subplot(3, 2, 2*idx + 2)
-            spec = torch.stft(torch.from_numpy(audio), n_fft=1024, hop_length=256, return_complex=True)
-            spec_mag = torch.abs(spec)
-            spec_db = 20 * torch.log10(spec_mag + 1e-8)
-            plt.imshow(spec_db.numpy(), aspect='auto', origin='lower', cmap='inferno', vmin=-100, vmax=20)
-            plt.title(f"{title} Spectrogram")
-            plt.colorbar(format='%+2.0f dB')
-            
-        plot_waveform_spectrogram(noisy_np, "Input (Noisy)", 0)
-        plot_waveform_spectrogram(clean_np, "Target (Clean)", 1)
-        plot_waveform_spectrogram(pred_aligned, f"Prediction (Aligned, Lag:{lag_pred})", 2)
+        def plot_spec(y, title, ax_idx):
+            D = librosa.stft(y, n_fft=1024, hop_length=256)
+            S_db = librosa.amplitude_to_db(np.abs(D), ref=np.max)
+            img = librosa.display.specshow(S_db, y_axis='linear', x_axis='time', sr=target_fs, 
+                                         hop_length=256, fmax=4000, ax=ax[ax_idx]) # fmax=4000 matches filter
+            ax[ax_idx].set_title(title)
+            ax[ax_idx].set_ylim(0, 4000) # Zoom in to 4kHz
+            return img
+
+        # Use filtered signals
+        plot_spec(noisy_filt[:min_len_filt], "Mixture (0-4kHz)", 0)
+        plot_spec(clean_filt[:min_len_filt], "Target (0-4kHz)", 1)
+        plot_spec(interferer_filt, "Interferer (0-4kHz)", 2)
+        plot_spec(pred_aligned_filt, "Reconstruction (0-4kHz)", 3)
         
         plt.tight_layout()
         plt.savefig(f"{output_dir}/inference_plot_{i}.png")
-        plt.close() # Close figure to free memory
+        plt.close()
         print(f"Saved plot_{i} to {output_dir}")
+        
+        # 8. Save Filtered Audio
+        # Save aligned filtered prediction
+        sf.write(f"{output_dir}/audio_{i}_pred_filtered.wav", pred_aligned_filt, target_fs)
+        # Save aligned filtered clean for comparison
+        sf.write(f"{output_dir}/audio_{i}_clean_filtered.wav", clean_aligned_pred_filt, target_fs)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', type=str, default='/workspace/Dataset/kul_all_subjects.lmdb')
-    parser.add_argument('--checkpoint', type=str, default='checkpoints/neurocodec/KUL/mamba-mel/best_model.pth')
+    parser.add_argument('--checkpoint', type=str, default='checkpoints/neurocodec/KUL/mamba-GAN/latest_model.pth')
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--subset', type=str, default='val', help="Dataset subset to use (train, val, test)")
     parser.add_argument('--num_samples', type=int, default=10, help="Number of samples to process")
