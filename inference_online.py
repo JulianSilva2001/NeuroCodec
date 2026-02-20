@@ -70,9 +70,11 @@ class OnlineInferenceEngine:
     Stateful sliding-window engine.
 
     Internal state per utterance:
-      audio_buffer   — (1, 1,   window_samples)  rolling mixed audio
-      eeg_buffer     — (1, 128, eeg_window)       rolling EEG
-      past_extracted — (1, 1,   hop_samples)      last output hop (auditory attractor)
+      audio_buffer — (1, 1,    window_samples)  rolling mixed audio
+      eeg_buffer   — (1, 128,  eeg_window)       rolling EEG
+      past_z       — (1, 1024, hop_dac)          auditory attractor in latent space
+                     Replaces the old audio-domain past_extracted; eliminates the
+                     dac.encode(past_speech) call that was redundant on every hop.
 
     Call process_full_segment() to run an entire pre-recorded utterance in
     online fashion (split into hops internally).  For true real-time use,
@@ -100,7 +102,12 @@ class OnlineInferenceEngine:
         self.eeg_window     = int(window_sec * eeg_sr)  # e.g. 256   @ 128 Hz
         self.eeg_hop        = int(hop_sec    * eeg_sr)  # e.g. 64    @ 128 Hz
 
-        # EMA coefficient for past_extracted update (0 = replace hard, 1 = never update)
+        # Compute exact DAC latent frames per hop (model stride, not fixed).
+        with torch.no_grad():
+            _dummy   = torch.zeros(1, 1, self.hop_samples, device=device)
+            self.hop_dac = model.encode_audio(_dummy)[0].shape[-1]
+
+        # EMA coefficient for past_z update (0 = replace hard, 1 = never update).
         # 0.7 means: keep 70% of history, blend in 30% of the new hop each step.
         # This prevents a single bad hop from fully poisoning the attractor.
         self.attractor_ema = 0.7
@@ -111,8 +118,8 @@ class OnlineInferenceEngine:
         """Initialise all buffers to silence (cold start)."""
         self.audio_buffer      = torch.zeros(1, 1,                self.window_samples, device=self.device)
         self.eeg_buffer        = torch.zeros(1, self.eeg_channels, self.eeg_window,    device=self.device)
-        self.past_extracted    = torch.zeros(1, 1,                self.hop_samples,    device=self.device)
-        self.hop_attractor_rms = []   # RMS of past_extracted at the START of each hop
+        self.past_z            = torch.zeros(1, 1024,             self.hop_dac,        device=self.device)
+        self.hop_attractor_rms = []   # latent-norm of past_z at the START of each hop
         self.hop_times         = []   # processing time (ms) for each hop
 
     # ── Single-hop step ────────────────────────────────────────────────────
@@ -126,8 +133,8 @@ class OnlineInferenceEngine:
         Process one incoming hop and return the corresponding output hop.
         """
 
-        # 0. Record attractor state BEFORE this step (shows cold-start warmup)
-        self.hop_attractor_rms.append(float(self.past_extracted.pow(2).mean().sqrt()))
+        # 0. Record attractor latent-norm BEFORE this step (shows cold-start warmup)
+        self.hop_attractor_rms.append(float(self.past_z.pow(2).mean().sqrt()))
         _t0 = time.perf_counter()
 
         # 1. Slide audio buffer: drop oldest hop, append new frame
@@ -140,15 +147,16 @@ class OnlineInferenceEngine:
             [self.eeg_buffer[:, :, self.eeg_hop:], new_eeg], dim=2
         )
 
-        # 3. Model inference
+        # 3. Model inference — pass latent past directly (no DAC encode of past needed)
         with torch.no_grad():
             z_pred, _, _, _ = self.model(
                 self.audio_buffer,
                 self.eeg_buffer,
-                past_speech=self.past_extracted,
+                past_speech=None,
                 force_no_speaker=False,
+                past_z=self.past_z,
             )
-            output_full = self.model.decode_audio(z_pred)   # (1, 1, T_out)
+            output_full = self.model.decode_audio(z_pred)   # (1, 1, T_out) — required for audio stream
 
         # 4. Take last hop_samples from decoded output
         T_out = output_full.shape[-1]
@@ -158,23 +166,19 @@ class OnlineInferenceEngine:
             # Safety pad (should not happen with a 2 s buffer)
             output_hop = F.pad(output_full, (self.hop_samples - T_out, 0))
 
-        # 5. Inference Normalization — match output RMS to input RMS (for audio output only)
+        # 5. Inference Normalization — match output RMS to input RMS (audio stream only)
         in_rms  = rms(new_audio)
         out_rms = rms(output_hop)
-        # Save the PRE-normalization copy for the attractor.
-        # Rationale: during training pseudo_past is raw decoded audio (not RMS-scaled).
-        # Scaling to a quiet input would drain attractor energy → weak speaker signal.
-        attractor_candidate = output_hop.detach()
         if out_rms > 1e-8:
             output_hop = output_hop * (in_rms / out_rms)
 
-        # 6. Update auditory attractor with EMA smoothing
-        #    Two problems this fixes vs hard replacement:
-        #      a) A single bad/silent hop no longer fully poisons the next step.
-        #      b) Uses pre-normalization audio so quiet segments don't drain energy.
-        self.past_extracted = (
-            self.attractor_ema       * self.past_extracted
-            + (1.0 - self.attractor_ema) * attractor_candidate
+        # 6. Update auditory attractor in latent space with EMA smoothing.
+        #    Using z_pred[:, :, -hop_dac:] directly avoids the old problem where
+        #    RMS-normalizing a quiet-input hop would drain attractor energy —
+        #    latents are not affected by the audio normalization above.
+        self.past_z = (
+            self.attractor_ema       * self.past_z
+            + (1.0 - self.attractor_ema) * z_pred[:, :, -self.hop_dac:].detach()
         )
 
         elapsed_ms = (time.perf_counter() - _t0) * 1000
@@ -324,7 +328,7 @@ def plot_online_sample(
     # ── Row 4: Auditory attractor RMS (shows online state evolving) ───────
     ax = axes[3, 0]
     ax.plot(hop_t, attractor_rms, marker='s', markersize=3, color='#9b59b6', linewidth=1.5)
-    ax.set_title("Auditory attractor RMS per hop  (past_extracted)", fontsize=10)
+    ax.set_title("Auditory attractor norm per hop  (past_z, latent space)", fontsize=10)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("RMS")
     ax.grid(True, alpha=0.3)

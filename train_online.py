@@ -185,7 +185,11 @@ def sliding_window_train_step(
     # Cold-start buffers (zeros, identical to inference _reset())
     audio_buf = torch.zeros(B, 1,            window_samples, device=device)
     eeg_buf   = torch.zeros(B, eeg_channels, eeg_window,     device=device)
-    past      = torch.zeros(B, 1,            hop_samples,    device=device)
+    # past_z stores the last hop_dac latent frames — replaces decoded audio.
+    # This eliminates the decode→re-encode round trip:
+    #   old: decode(z_pred_h) → audio → dac.encode(audio) → latents
+    #   new: z_pred_h[:, :, -hop_dac:]  (already latents, no DAC call needed)
+    past_z    = torch.zeros(B, 1024, hop_dac, device=device)
 
     total_loss    = 0.0
     speaker_steps = 0
@@ -201,28 +205,35 @@ def sliding_window_train_step(
 
         if h == 0:
             # ── Hop 0: Two-pass cold start ─────────────────────────────────
+            # Pass 1: EEG-only, no speaker encoder.
+            # z_mix_h is captured here so Pass 2 can reuse it — this avoids
+            # encoding the same audio_buf a second time (double-encode fix).
             with torch.no_grad():
-                z_p1, _, _, _ = model(
+                z_p1, _, z_mix_h, _ = model(
                     audio_buf, eeg_buf,
                     past_speech=None, force_no_speaker=True,
                 )
-                pseudo_audio = model.decode_audio(z_p1)
-            pseudo_past = pseudo_audio[:, :, -hop_samples:].detach()
-            pseudo_rms  = float(pseudo_past.pow(2).mean().sqrt())
+            # Pseudo-past in latent space — no decode needed.
+            # pseudo_rms is a latent-norm proxy (same diagnostic purpose).
+            pseudo_past_z = z_p1[:, :, -hop_dac:].detach()
+            pseudo_rms    = float(pseudo_past_z.pow(2).mean().sqrt())
 
             use_speaker = random.random() > model.speaker_dropout_prob
             z_pred_h, _, _, _ = model(
                 audio_buf, eeg_buf,
-                past_speech=pseudo_past if use_speaker else None,
+                past_speech=None,
                 force_no_speaker=not use_speaker,
+                past_z=pseudo_past_z if use_speaker else None,
+                z_mix_precomputed=z_mix_h,   # reuse — no second DAC encode
             )
         else:
             # ── Hop 1+: real previous output as attractor ──────────────────
             use_speaker = random.random() > model.speaker_dropout_prob
             z_pred_h, _, _, _ = model(
                 audio_buf, eeg_buf,
-                past_speech=past if use_speaker else None,
+                past_speech=None,
                 force_no_speaker=not use_speaker,
+                past_z=past_z if use_speaker else None,
             )
 
         speaker_steps += int(use_speaker)
@@ -236,8 +247,8 @@ def sliding_window_train_step(
         total_loss += criterion(z_pred_last, z_target_h)
 
         # ── Update attractor for next hop (detach = no BPTT) ───────────────
-        with torch.no_grad():
-            past = model.decode_audio(z_pred_h)[:, :, -hop_samples:].detach()
+        # Storing latents directly: zero DAC calls required.
+        past_z = z_pred_h[:, :, -hop_dac:].detach()
 
     return total_loss, speaker_steps, pseudo_rms, num_hops
 
@@ -246,9 +257,38 @@ def sliding_window_train_step(
 # Validation (single-pass, EEG-only — measures baseline capability)
 # ---------------------------------------------------------------------------
 
-def validate(model, loader, criterion, device, args):
+def validate(
+    model,
+    loader,
+    criterion,
+    device,
+    args,
+    window_samples: int,
+    eeg_window:     int,
+    hop_samples:    int,
+    eeg_hop:        int,
+    hop_dac:        int,
+):
+    """
+    Sliding-window validation that faithfully mirrors inference dynamics:
+
+      Hop 0  — EEG-only cold start  (no speaker encoder)
+      Hop 1+ — speaker encoder ON   (past = decoded output of previous hop)
+
+    Reports three losses:
+      val_loss   — mean per-hop loss across all hops  (drives scheduler)
+      val_cold   — hop-0 loss only  (cold-start capability)
+      val_steady — hop-1+ loss only (steady-state, speaker-encoder quality)
+
+    SI-SDR is computed on the full reconstructed waveform assembled from the
+    kept-frame latents of every hop, decoded in one shot.
+    """
     model.eval()
-    total_loss  = 0.0
+    total_loss   = 0.0
+    cold_loss    = 0.0
+    steady_loss  = 0.0
+    cold_hops    = 0
+    steady_hops  = 0
     sisdr_scores = []
 
     with torch.no_grad():
@@ -257,31 +297,92 @@ def validate(model, loader, criterion, device, args):
             clean = clean.to(device)
             eeg   = eeg.to(device)
 
-            z_target, _ = model.encode_audio(clean)
+            z_target_full, _ = model.encode_audio(clean)
+            T_dac_total  = z_target_full.shape[-1]
+            B            = noisy.shape[0]
+            eeg_channels = eeg.shape[1]
 
-            # EEG-only pass (no speaker encoder) for fair baseline validation
-            z_pred, _, _, _ = model(
-                noisy, eeg,
-                past_speech=None,
-                force_no_speaker=True,
-            )
-            loss = criterion(z_pred, z_target)
-            total_loss += loss.item()
+            # Pad to exact hop multiples (same as training step)
+            pad_audio = (-noisy.shape[-1]) % hop_samples
+            if pad_audio > 0:
+                noisy = F.pad(noisy, (0, pad_audio))
+            pad_eeg = (-eeg.shape[-1]) % eeg_hop
+            if pad_eeg > 0:
+                eeg = F.pad(eeg, (0, pad_eeg))
 
-            # Decode, align via cross-correlation, then compute SI-SDR
-            pred_audio = model.decode_audio(z_pred)
-            min_len    = min(pred_audio.shape[-1], clean.shape[-1])
-            pred_np    = pred_audio[..., :min_len].cpu().numpy().squeeze(1)  # (B, T)
-            clean_np   = clean[..., :min_len].cpu().numpy().squeeze(1)       # (B, T)
+            num_hops = noisy.shape[-1] // hop_samples
+
+            # Cold-start buffers — identical to inference _reset()
+            audio_buf = torch.zeros(B, 1,            window_samples, device=device)
+            eeg_buf   = torch.zeros(B, eeg_channels, eeg_window,     device=device)
+            past_z    = torch.zeros(B, 1024,         hop_dac,        device=device)
+
+            batch_loss = 0.0
+            z_kept     = []   # per-hop kept latent frames → assembled for SI-SDR
+
+            for h in range(num_hops):
+                a0, a1 = h * hop_samples, (h + 1) * hop_samples
+                e0, e1 = h * eeg_hop,     (h + 1) * eeg_hop
+
+                # Slide buffers
+                audio_buf = torch.cat([audio_buf[:, :, hop_samples:], noisy[:, :, a0:a1]], dim=2)
+                eeg_buf   = torch.cat([eeg_buf[:,  :, eeg_hop:],     eeg[:,  :, e0:e1]],  dim=2)
+
+                if h == 0:
+                    # ── Cold start: EEG-only ────────────────────────────────
+                    z_pred_h, _, _, _ = model(
+                        audio_buf, eeg_buf,
+                        past_speech=None,
+                        force_no_speaker=True,
+                    )
+                else:
+                    # ── Steady state: speaker encoder ON (latent past) ──────
+                    z_pred_h, _, _, _ = model(
+                        audio_buf, eeg_buf,
+                        past_speech=None,
+                        force_no_speaker=False,
+                        past_z=past_z,
+                    )
+
+                # Update latent attractor — no DAC decode required
+                past_z = z_pred_h[:, :, -hop_dac:]
+
+                # Loss on the kept frames (last hop_dac DAC frames)
+                d0 = h * hop_dac
+                d1 = min(d0 + hop_dac, T_dac_total)
+                actual_hop_dac = d1 - d0
+                z_target_h  = z_target_full[:, :, d0:d1]
+                z_pred_last = z_pred_h[:, :, -actual_hop_dac:]
+                hop_loss    = criterion(z_pred_last, z_target_h).item()
+
+                batch_loss += hop_loss
+                if h == 0:
+                    cold_loss  += hop_loss;  cold_hops  += 1
+                else:
+                    steady_loss += hop_loss; steady_hops += 1
+
+                z_kept.append(z_pred_last)
+
+            total_loss += batch_loss / num_hops
+
+            # ── SI-SDR on fully reconstructed waveform ─────────────────────
+            z_pred_full = torch.cat(z_kept, dim=-1)[:, :, :T_dac_total]
+            pred_audio  = model.decode_audio(z_pred_full)
+            min_len     = min(pred_audio.shape[-1], clean.shape[-1])
+            pred_np     = pred_audio[..., :min_len].cpu().numpy().squeeze(1)
+            clean_np    = clean[..., :min_len].cpu().numpy().squeeze(1)
             for ref, est in zip(clean_np, pred_np):
                 sisdr_scores.append(align_and_sisdr(ref, est))
 
             if args.debug and batch_idx > 2:
                 break
 
-    mean_loss   = total_loss / max(len(loader), 1)
+    n_batches   = max(len(loader), 1)
+    mean_loss   = total_loss  / n_batches
+    mean_cold   = cold_loss   / max(cold_hops,   1)
+    mean_steady = steady_loss / max(steady_hops, 1)
     mean_sisdr  = float(np.mean(sisdr_scores)) if sisdr_scores else 0.0
-    return mean_loss, mean_sisdr
+    return mean_loss, mean_sisdr, mean_cold, mean_steady
 
 
 # ---------------------------------------------------------------------------
@@ -434,11 +535,11 @@ def train(args):
 
             # ── Backward ──────────────────────────────────────────────────
             optimizer.zero_grad()
-            loss.backward()
+            (loss / n_hops).backward()   # normalise gradient by hop count
             torch.nn.utils.clip_grad_norm_(trainable, max_norm=5.0)
             optimizer.step()
 
-            train_loss     += loss.item() / n_hops   # normalise for logging
+            train_loss     += loss.item() / n_hops   # same scale as backward
             speaker_steps  += hop_spk
             pseudo_rms_sum += hop_rms
 
@@ -461,31 +562,40 @@ def train(args):
                 break
 
         # ── Validation ────────────────────────────────────────────────────
-        val_loss, val_sisdr = validate(model, val_loader, criterion, device, args)
+        val_loss, val_sisdr, val_cold, val_steady = validate(
+            model, val_loader, criterion, device, args,
+            window_samples, eeg_window, hop_samples, eeg_hop, hop_dac,
+        )
         scheduler.step(val_loss)
 
         avg_train = train_loss / max(len(train_loader), 1)
         print(
             f"Epoch {epoch+1:3d} | "
-            f"Train {avg_train:.4f} | Val {val_loss:.4f} | SI-SDR {val_sisdr:.2f} dB"
+            f"Train {avg_train:.4f} | Val {val_loss:.4f} | "
+            f"Cold {val_cold:.4f} | Steady {val_steady:.4f} | SI-SDR {val_sisdr:.2f} dB"
         )
 
         # ── Checkpoints ───────────────────────────────────────────────────
+        # Update best_val_loss FIRST so the checkpoint always stores the
+        # current (not previous-epoch) value — prevents stale reads on resume.
+        is_best = val_loss < best_val_loss
+        if is_best:
+            best_val_loss = val_loss
+
         # Save full training state so training can be resumed exactly
         torch.save({
             'epoch':         epoch,
             'model':         model.state_dict(),
             'optimizer':     optimizer.state_dict(),
             'scheduler':     scheduler.state_dict(),
-            'best_val_loss': best_val_loss,
+            'best_val_loss': best_val_loss,   # always current
         }, os.path.join(args.checkpoint_dir, "latest_checkpoint.pth"))
 
         # Also save inference-ready model-only weights
         torch.save(model.state_dict(),
                    os.path.join(args.checkpoint_dir, "latest_model.pth"))
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if is_best:
             torch.save(model.state_dict(),
                        os.path.join(args.checkpoint_dir, "best_model.pth"))
             print("  → Saved best model.")

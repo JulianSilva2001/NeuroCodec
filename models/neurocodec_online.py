@@ -48,14 +48,12 @@ class SpeakerEncoder(nn.Module):
         self.pos  = PositionalEncoding(hidden_dim)
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, dac_model: nn.Module, past_speech: torch.Tensor) -> torch.Tensor:
+    def forward(self, z_past: torch.Tensor) -> torch.Tensor:
         """
-        dac_model:   frozen DAC model (shared with OnlineNeuroCodec)
-        past_speech: (B, 1, T_past)
+        z_past: (B, 1024, T_dac) — pre-encoded latents of past speech.
+        The caller is responsible for encoding; this removes the DAC encode
+        from the hot path so training never pays for a redundant encode+decode.
         """
-        with torch.no_grad():
-            z_past, _, _, _, _ = dac_model.encode(past_speech)   # (B, 1024, T_dac)
-
         z = z_past.transpose(1, 2)   # (B, T_dac, 1024)
         z = self.proj(z)             # (B, T_dac, H)
         z = self.ln(z)
@@ -220,39 +218,55 @@ class OnlineNeuroCodec(nn.Module):
 
     def forward(
         self,
-        mixture:         torch.Tensor,
-        eeg:             torch.Tensor,
-        past_speech:     torch.Tensor | None = None,
-        force_no_speaker: bool = False,
+        mixture:            torch.Tensor,
+        eeg:                torch.Tensor,
+        past_speech:        torch.Tensor | None = None,
+        force_no_speaker:   bool = False,
+        past_z:             torch.Tensor | None = None,
+        z_mix_precomputed:  torch.Tensor | None = None,
     ):
         """
-        mixture:          (B, 1,   T_audio)  — mixed speech buffer
-        eeg:              (B, 128, T_eeg)    — EEG window (same duration)
-        past_speech:      (B, 1,   T_past)   — 0.5 s of last extracted audio
-                          (None = cold start / speaker dropout)
-        force_no_speaker: bool               — skip speaker encoder even if
-                                               past_speech is provided
+        mixture:           (B, 1,    T_audio)  — mixed speech buffer
+        eeg:               (B, 128,  T_eeg)    — EEG window (same duration)
+        past_speech:       (B, 1,    T_past)   — raw past audio (inference path only)
+        force_no_speaker:  bool                — skip speaker encoder entirely
+        past_z:            (B, 1024, T_dac)    — pre-encoded past latents (training path)
+                           When provided, the speaker encoder uses these directly
+                           and no DAC encode is performed — eliminates the decode→
+                           re-encode round trip that dominated training time.
+        z_mix_precomputed: (B, 1024, T_dac)    — pre-encoded mixture latents
+                           When provided, DAC encode of `mixture` is skipped.
+                           Used to share z_mix between Pass-1 and Pass-2 at Hop 0.
 
         Returns:
             z_pred    (B, 1024, T_dac)   — predicted clean-speech latents
-            codes_mix                    — DAC codes of mixture
+            codes_mix                    — DAC codes of mixture (None if precomputed)
             z_mix     (B, 1024, T_dac)   — mixture latents
             eeg_feat  (B, 64,   T_eeg')  — encoded EEG features
         """
 
-        # 1. Encode mixture with frozen DAC
-        z_mix, codes_mix = self.encode_audio(mixture)          # (B, 1024, T_dac)
+        # 1. Encode mixture with frozen DAC (or reuse precomputed latents)
+        if z_mix_precomputed is not None:
+            z_mix, codes_mix = z_mix_precomputed, None
+        else:
+            z_mix, codes_mix = self.encode_audio(mixture)      # (B, 1024, T_dac)
 
         # 2. Neuronal attractor (EEG → hidden_dim)
         eeg_feat = self.eeg_encoder(eeg)                       # (B, 64, T_eeg')
         x_eeg    = self.eeg_proj(eeg_feat.transpose(1, 2))    # (B, T_eeg', H)
 
-        # 3. Auditory attractor (past speech → hidden_dim)
-        use_speaker = (past_speech is not None) and (not force_no_speaker)
-        x_speaker = (
-            self.speaker_encoder(self.dac, past_speech)        # (B, T_spk, H)
-            if use_speaker else None
-        )
+        # 3. Auditory attractor (past → hidden_dim)
+        #    Training: past_z provided → no DAC call needed (fast path)
+        #    Inference: past_speech provided → encode here (backward-compatible)
+        use_speaker = (past_z is not None or past_speech is not None) and (not force_no_speaker)
+        if use_speaker:
+            if past_z is None:
+                # Inference path: encode raw audio to latents
+                with torch.no_grad():
+                    past_z, _, _, _, _ = self.dac.encode(past_speech)
+            x_speaker = self.speaker_encoder(past_z)           # (B, T_spk, H)
+        else:
+            x_speaker = None
 
         # 4. Audio features
         scale   = math.sqrt(self.audio_proj.out_features)
