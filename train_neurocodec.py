@@ -1,5 +1,7 @@
 
 import os
+import json
+from datetime import datetime
 import argparse
 import torch
 import torch.nn as nn
@@ -8,14 +10,14 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import wandb
 import numpy as np
-import dac.model # Added this import
+import dac.model  # Added this import
 
 # Local imports
 from models.neurocodec import NeuroCodec
 from dataset_neurocodec import load_NeuroCodecDataset, load_KUL_NeuroCodecDataset
 # Consolidated and updated imports from 'losses' and 'losses_neurocodec'
-from losses import MelSpectrogramLoss, GANLoss # Added GANLoss
-from losses_neurocodec import NeuroCodecLoss # Kept this as it was in the original code
+from losses import MelSpectrogramLoss, GANLoss  # Added GANLoss
+from losses_neurocodec import NeuroCodecLoss  # Kept this as it was in the original code
 
 def sisdr(reference, estimation):
     """
@@ -28,9 +30,6 @@ def sisdr(reference, estimation):
     """
     reference_energy = np.sum(reference ** 2, axis=-1, keepdims=True)
     
-    # This is to avoid zero energy
-    # reference_energy[reference_energy == 0] = 1e-8
-
     # Optimal scaling factor
     alpha = np.sum(reference * estimation, axis=-1, keepdims=True) / (reference_energy + 1e-8)
     
@@ -63,10 +62,7 @@ def train(args):
     # 2. Dataset
     print("Loading Dataset...")
     if args.dataset == 'kul':
-        args.eeg_channels = 64 # Force 64 for KUL unless specified otherwise? No, respect arg but default is 128.
-        # Check if user overrode default 128
-        # Argparse doesn't tell us if it was default or user-specified easily without a separate flag.
-        # But we can just warn.
+        args.eeg_channels = 64
         if args.eeg_channels == 128:
              print("Info: KUL dataset selected, defaulting EEG channels to 64 (overriding 128).")
              args.eeg_channels = 64
@@ -93,12 +89,12 @@ def train(args):
         )
     elif args.dataset == 'kul':
          train_loader = load_KUL_NeuroCodecDataset(
-            lmdb_path=args.root, # Root should be LMDB path for KUL
+            lmdb_path=args.root,
             subset='train',
             batch_size=args.batch_size,
             num_gpus=1,
             target_fs=target_fs,
-            original_fs=16000 # Correct FS
+            original_fs=16000
          )
          val_loader = load_KUL_NeuroCodecDataset(
             lmdb_path=args.root,
@@ -106,7 +102,7 @@ def train(args):
             batch_size=args.batch_size,
             num_gpus=1,
             target_fs=target_fs,
-            original_fs=16000 # Correct FS
+            original_fs=16000
          )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
@@ -114,8 +110,8 @@ def train(args):
     model = NeuroCodec(
         dac_model_type=dac_model_type,
         eeg_in_channels=args.eeg_channels,
-        hidden_dim=args.hidden_dim, # e.g. 256
-        num_layers=args.num_layers,  # e.g. 4
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
         backbone=args.backbone,
         activation=args.activation
     ).to(device)
@@ -123,25 +119,7 @@ def train(args):
     if not args.debug:
         wandb.watch(model, log="all", log_freq=100)
     
-    # 3.1 Load Checkpoint if Exists (Resume Training)
-    latest_checkpoint = os.path.join(args.checkpoint_dir, "latest_model.pth")
-    if os.path.exists(latest_checkpoint):
-        print(f"Resuming from checkpoint: {latest_checkpoint}")
-        try:
-             # Use weights_only=False due to warnings but consider safer alternative if needed
-             checkpoint = torch.load(latest_checkpoint, map_location=device)
-             model.load_state_dict(checkpoint)
-             print("Checkpoint loaded successfully.")
-        except Exception as e:
-             print(f"Failed to load checkpoint: {e}. Starting from scratch.")
-    else:
-        print("No existing checkpoint found. Starting from scratch.")
-    
-    # 4. Optimizer
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-2) 
-    
-    # Updated: Transformer Ablation (No Envelope Loss per user request)
-    # lambda_env=0.0 removes PCC loss
+    # 3. Loss Functions
     criterion = NeuroCodecLoss(lambda_recon=1.0, lambda_env=0.0).to(device)
     mel_loss_fn = MelSpectrogramLoss(
         sample_rate=16000,
@@ -154,35 +132,158 @@ def train(args):
     discriminator = dac.model.Discriminator(sample_rate=16000).to(device)
     gan_loss_fn = GANLoss(discriminator).to(device)
     
-    # Optimizers
-    # Generator Optimizer (NeuroCodec)
+    # 4. Optimizers
     optimizer_g = optim.AdamW(model.parameters(), lr=args.lr, betas=(0.5, 0.9))
-    scheduler_g = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer_g, mode='min', factor=0.5, patience=5
-    )
-    
-    # Discriminator Optimizer
     optimizer_d = optim.AdamW(discriminator.parameters(), lr=args.lr, betas=(0.5, 0.9))
-    scheduler_d = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer_d, mode='min', factor=0.5, patience=5
-    )
     
-    # 5. Training Loop
+    # Scheduler for Phase 6 (created later when entering phase 6)
+    scheduler_g = None
+    scheduler_d = None
+    
+    # =========================================================================
+    # MULTI-PHASE STATE MACHINE
+    # =========================================================================
+    # Phase 1: MSE only
+    # Phase 2: MSE + Mel (LR -> 1e-4, lambda_mel ramps 2->13)
+    # Phase 3: MSE + Mel (lambda_mel=13, LR -> 5e-5), until SI-SDR plateaus
+    # Phase 4: Freeze generator, train discriminator only for 4 epochs
+    # Phase 5: Unfreeze, ramp GAN lambdas (lambda_gan 0.5->1.0, lambda_feat 1.0->2.0)
+    # Phase 6: Hold all lambdas, use ReduceLROnPlateau scheduler
+    # =========================================================================
+    
+    phase = 1
+    phase_epoch = 0          # epoch counter within current phase
+    lambda_mel = 0.0
+    lambda_gan = 0.0
+    lambda_feat = 0.0
+    best_sisdr = -float('inf')
+    sisdr_patience_counter = 0
     best_val_loss = float('inf')
+    start_epoch = 0
     
-    for epoch in range(args.epochs):
-        model.train()
-        discriminator.train()
-        total_loss = 0
-        total_g_loss = 0
-        total_d_loss = 0
+    # 5. Load checkpoint if exists (resume training)
+    checkpoint_path = os.path.join(args.checkpoint_dir, "training_state.pth")
+    if os.path.exists(checkpoint_path):
+        print(f"Resuming from checkpoint: {checkpoint_path}")
+        try:
+            ckpt = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(ckpt['model_state_dict'])
+            discriminator.load_state_dict(ckpt['discriminator_state_dict'])
+            optimizer_g.load_state_dict(ckpt['optimizer_g_state_dict'])
+            optimizer_d.load_state_dict(ckpt['optimizer_d_state_dict'])
+            phase = ckpt.get('phase', 1)
+            phase_epoch = ckpt.get('phase_epoch', 0)
+            lambda_mel = ckpt.get('lambda_mel', 0.0)
+            lambda_gan = ckpt.get('lambda_gan', 0.0)
+            lambda_feat = ckpt.get('lambda_feat', 0.0)
+            best_sisdr = ckpt.get('best_sisdr', -float('inf'))
+            sisdr_patience_counter = ckpt.get('sisdr_patience_counter', 0)
+            best_val_loss = ckpt.get('best_val_loss', float('inf'))
+            start_epoch = ckpt.get('epoch', 0) + 1
+            
+            # Recreate schedulers if in phase 6
+            if phase == 6:
+                scheduler_g = optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer_g, mode='min', factor=0.5, patience=5
+                )
+                scheduler_d = optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer_d, mode='min', factor=0.5, patience=5
+                )
+                if 'scheduler_g_state_dict' in ckpt:
+                    scheduler_g.load_state_dict(ckpt['scheduler_g_state_dict'])
+                if 'scheduler_d_state_dict' in ckpt:
+                    scheduler_d.load_state_dict(ckpt['scheduler_d_state_dict'])
+            
+            print(f"Resumed at epoch {start_epoch}, Phase {phase}, phase_epoch {phase_epoch}")
+            print(f"  lambda_mel={lambda_mel:.1f}, lambda_gan={lambda_gan:.2f}, lambda_feat={lambda_feat:.2f}")
+            print(f"  best_sisdr={best_sisdr:.2f}, patience={sisdr_patience_counter}")
+        except Exception as e:
+            print(f"Failed to load checkpoint: {e}. Starting from scratch.")
+            start_epoch = 0
+            phase = 1
+    else:
+        # Also try loading a legacy checkpoint (just model weights)
+        legacy_ckpt = os.path.join(args.checkpoint_dir, "latest_model.pth")
+        if os.path.exists(legacy_ckpt):
+            print(f"Found legacy checkpoint: {legacy_ckpt}")
+            try:
+                model.load_state_dict(torch.load(legacy_ckpt, map_location=device))
+                print("Legacy model weights loaded. Starting from Phase 1, epoch 0.")
+            except Exception as e:
+                print(f"Failed to load legacy checkpoint: {e}. Starting from scratch.")
+        else:
+            print("No existing checkpoint found. Starting from scratch.")
+    
+    # =========================================================================
+    # HELPER: Set LR for all param groups
+    # =========================================================================
+    def set_lr(optimizer, lr):
+        for pg in optimizer.param_groups:
+            pg['lr'] = lr
+    
+    # =========================================================================
+    # HELPER: Check SI-SDR plateau
+    # =========================================================================
+    def check_sisdr_plateau(current_sisdr):
+        nonlocal best_sisdr, sisdr_patience_counter
+        if current_sisdr > best_sisdr:
+            best_sisdr = current_sisdr
+            sisdr_patience_counter = 0
+            return False  # Not plateaued
+        else:
+            sisdr_patience_counter += 1
+            if sisdr_patience_counter >= 3:
+                return True  # Plateaued
+            return False
+    
+    # =========================================================================
+    # TRAINING LOOP
+    # =========================================================================
+    print(f"\n{'='*60}")
+    print(f"Starting training at Phase {phase}")
+    print(f"{'='*60}\n")
+    
+    for epoch in range(start_epoch, args.epochs):
+        # =================================================================
+        # PHASE-SPECIFIC SETUP (at start of each epoch)
+        # =================================================================
         
-        # Determine when to start GAN training
-        use_gan = epoch >= args.gan_start_epoch
+        # Determine what to train this epoch based on phase
+        train_generator = (phase != 4)
+        train_discriminator = (phase >= 4)
+        use_mel = (phase >= 2)
+        use_gan = (phase >= 5)
+        
+        # Phase 4: freeze generator
+        if phase == 4:
+            model.eval()
+            for p in model.parameters():
+                p.requires_grad_(False)
+            discriminator.train()
+        else:
+            model.train()
+            for p in model.parameters():
+                p.requires_grad_(True)
+            if train_discriminator:
+                discriminator.train()
         
         current_lr_g = optimizer_g.param_groups[0]['lr']
         current_lr_d = optimizer_d.param_groups[0]['lr']
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [LR_G: {current_lr_g:.1e}, LR_D: {current_lr_d:.1e}]")
+        
+        phase_str = f"Phase {phase}"
+        desc = f"Epoch {epoch+1}/{args.epochs} [{phase_str}] [LR_G: {current_lr_g:.1e}"
+        if train_discriminator:
+            desc += f", LR_D: {current_lr_d:.1e}"
+        desc += f", λ_mel={lambda_mel:.1f}"
+        if use_gan:
+            desc += f", λ_gan={lambda_gan:.2f}, λ_feat={lambda_feat:.2f}"
+        desc += "]"
+        
+        pbar = tqdm(train_loader, desc=desc)
+        
+        total_loss = 0
+        total_g_loss = 0
+        total_d_loss = 0
         
         for batch_idx, (noisy, eeg, clean) in enumerate(pbar):
             noisy = noisy.to(device)
@@ -190,41 +291,31 @@ def train(args):
             eeg = eeg.to(device)
 
             if args.noise_cue:
-                # Replace EEG with Gaussian Noise matching statistics
                 eeg_mean = eeg.mean()
                 eeg_std = eeg.std()
                 eeg = torch.randn_like(eeg) * eeg_std + eeg_mean
                 
             # --- Generator Forward ---
-            # 1. Encode Target (for Recon Loss)
             with torch.no_grad():
                 z_target, _, _, _, _ = model.dac.encode(clean)
             
-            # 2. Model Forward
-            z_pred, _, _, _, _, env_pred = model(noisy, eeg)
+            if train_generator:
+                z_pred, _, _, _, _, env_pred = model(noisy, eeg)
+            else:
+                with torch.no_grad():
+                    z_pred, _, _, _, _, env_pred = model(noisy, eeg)
             
-            # Decode for GAN / Mel Loss (Using Gumbel Softmax or Straight Through in Quantizer inside DAC?)
-            # DAC encode returns z, codes, latents, etc. 
-            # We need differentiable audio for GAN.
-            # model.dac.decode(z_pred) should be differentiable if z_pred is differentiable.
-            # But z_pred usually goes through quantizer.
-            # Let's assume model(noisy, eeg) returns 'z_pred' which is the predicted latent.
-            # We need to pass this through DAC's quantizer (straight-through) and decoder.
-            
-            # DAC Quantizer
-            # The quantizer returns (z_q, codes, latents, bandwidth, commit_loss)
-            z_q, _, _, _, _ = model.dac.quantizer(z_pred, n_quantizers=9) # Use 9 quantizers as in validate
-            
-            # Decode
-            pred_audio = model.dac.decode(z_q)
-            
-            # Align lengths (pred_audio might be slightly longer/shorter due to padding/striding)
-            min_len = min(pred_audio.shape[-1], clean.shape[-1])
-            pred_audio = pred_audio[..., :min_len]
-            clean_aligned = clean[..., :min_len]
+            # Quantize & decode for mel/GAN losses
+            if use_mel or use_gan or train_discriminator:
+                z_q, _, _, _, _ = model.dac.quantizer(z_pred, n_quantizers=9)
+                pred_audio = model.dac.decode(z_q)
+                
+                min_len = min(pred_audio.shape[-1], clean.shape[-1])
+                pred_audio = pred_audio[..., :min_len]
+                clean_aligned = clean[..., :min_len]
             
             # --- Discriminator Step ---
-            if use_gan:
+            if train_discriminator:
                 optimizer_d.zero_grad()
                 d_loss = gan_loss_fn.discriminator_loss(pred_audio.detach(), clean_aligned)
                 d_loss.backward()
@@ -234,156 +325,325 @@ def train(args):
                 d_loss = torch.tensor(0.0)
 
             # --- Generator Step ---
-            # Update Generator only if not in warmup
-            train_generator = epoch >= args.disc_warmup_epochs
-            
-            optimizer_g.zero_grad()
-            
             if train_generator:
-                # 1. Reconstruction Losses (MSE, Env, PCC)
+                optimizer_g.zero_grad()
+                
+                # 1. MSE Reconstruction Loss (always on)
                 recon_loss, loss_dict = criterion(z_pred, z_target, env_pred, clean)
                 
                 # 2. Mel Spectrogram Loss
-                if epoch >= args.mel_start_epoch:
+                if use_mel and lambda_mel > 0:
                     mel_loss = mel_loss_fn(pred_audio, clean_aligned)
-                    recon_loss += args.lambda_mel * mel_loss
+                    recon_loss += lambda_mel * mel_loss
                     loss_dict['loss_mel'] = mel_loss.item()
                 else:
                     loss_dict['loss_mel'] = 0.0
                 
                 # 3. GAN Generator Loss
-                if use_gan:
+                if use_gan and lambda_gan > 0:
                     g_loss_adv, g_loss_feat = gan_loss_fn.generator_loss(pred_audio, clean_aligned)
-                    gan_term = args.lambda_gan * g_loss_adv + args.lambda_feat * g_loss_feat
+                    gan_term = lambda_gan * g_loss_adv + lambda_feat * g_loss_feat
                     recon_loss += gan_term
                     loss_dict['loss_adv'] = g_loss_adv.item()
                     loss_dict['loss_feat'] = g_loss_feat.item()
-                    total_g_loss += g_loss_adv.item() + g_loss_feat.item() 
+                    total_g_loss += g_loss_adv.item() + g_loss_feat.item()
                 
                 recon_loss.backward()
-                # Gradient Clipping (Prevent Explosion) for Generator
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer_g.step()
                 
                 total_loss += recon_loss.item()
                 log_recon_loss = recon_loss.item()
             else:
-                # Generator Frozen: Calculate loss for logging but don't backward
+                # Phase 4: generator frozen, just log
                 with torch.no_grad():
-                     recon_loss, loss_dict = criterion(z_pred, z_target, env_pred, clean)
-                     log_recon_loss = recon_loss.item()
-                     loss_dict['loss_mel'] = 0.0
-                     if use_gan: # Log what G loss would be
-                        g_loss_adv, g_loss_feat = gan_loss_fn.generator_loss(pred_audio, clean_aligned)
-                        loss_dict['loss_adv'] = g_loss_adv.item()
-                        loss_dict['loss_feat'] = g_loss_feat.item()
+                    recon_loss, loss_dict = criterion(z_pred, z_target, env_pred, clean)
+                    log_recon_loss = recon_loss.item()
+                    loss_dict['loss_mel'] = 0.0
             
             # Logging
             postfix = {
-                'loss': f"{log_recon_loss:.4f}", 
+                'phase': phase,
+                'loss': f"{log_recon_loss:.4f}",
                 'mse': f"{loss_dict['loss_recon']:.4f}",
             }
-            if not train_generator:
-                postfix['WARMUP'] = "D_ONLY"
-                # 'env': f"{loss_dict.get('loss_env', 0):.4f}", # Removed env
-            if 'loss_mel' in loss_dict:
+            if use_mel:
                 postfix['mel'] = f"{loss_dict['loss_mel']:.4f}"
-            if use_gan:
+                postfix['λm'] = f"{lambda_mel:.0f}"
+            if train_discriminator:
                 postfix['d_loss'] = f"{d_loss.item():.4f}"
-                postfix['g_adv'] = f"{loss_dict['loss_adv']:.4f}"
-                postfix['g_feat'] = f"{loss_dict['loss_feat']:.4f}"
+            if use_gan:
+                postfix['g_adv'] = f"{loss_dict.get('loss_adv', 0):.4f}"
+                postfix['g_feat'] = f"{loss_dict.get('loss_feat', 0):.4f}"
+            if phase == 4:
+                postfix['DISC_ONLY'] = f"{phase_epoch+1}/4"
                 
             pbar.set_postfix(postfix)
             
             if not args.debug:
                 log_dict = {
-                    "train_loss": recon_loss.item(),
+                    "train_loss": log_recon_loss,
                     "train_loss_recon": loss_dict['loss_recon'],
-                    "train_loss_env": loss_dict.get('loss_env', 0.0), # Use get
-                    "train_pcc": loss_dict.get('pcc', 0.0), # Use get
                     "lr_g": current_lr_g,
-                    "lr_d": current_lr_d
+                    "lr_d": current_lr_d,
+                    "phase": phase,
+                    "lambda_mel": lambda_mel,
+                    "lambda_gan": lambda_gan,
+                    "lambda_feat": lambda_feat,
                 }
-                if 'loss_mel' in loss_dict:
+                if use_mel:
                     log_dict['train_loss_mel'] = loss_dict['loss_mel']
-                    log_dict['lambda_mel'] = args.lambda_mel
-                
-                if use_gan:
-                    log_dict['train_loss_adv'] = loss_dict['loss_adv']
-                    log_dict['train_loss_feat'] = loss_dict['loss_feat']
+                if train_discriminator:
                     log_dict['train_loss_d'] = d_loss.item()
+                if use_gan:
+                    log_dict['train_loss_adv'] = loss_dict.get('loss_adv', 0.0)
+                    log_dict['train_loss_feat'] = loss_dict.get('loss_feat', 0.0)
                     
                 wandb.log(log_dict)
             
-            # Optional: Overfit check (break early)
             if args.debug and batch_idx > 5:
                 break
-                
         
-        # Validation
+        # =================================================================
+        # VALIDATION
+        # =================================================================
+        val_loss = None
+        val_sisdr = None
+        
         if (epoch + 1) % args.val_interval == 0:
-            val_loss, val_sisdr, val_estoi = validate(model, train_loader, criterion, device, args)
+            val_loss, val_sisdr = validate(model, val_loader, criterion, device, args)
             
-            # Step Schedulers
-            scheduler_g.step(val_loss)
-            scheduler_d.step(val_loss)
-            
-            print(f"Epoch {epoch+1} | Train Loss: {total_loss/len(train_loader):.4f} | Val Loss: {val_loss:.4f} | Val SI-SDR: {val_sisdr:.2f} dB | Val ESTOI: {val_estoi:.4f}")
+            print(f"\nEpoch {epoch+1} [Phase {phase}] | "
+                  f"Train Loss: {total_loss/max(len(train_loader),1):.4f} | "
+                  f"Val MSE: {val_loss:.4f} | Val SI-SDR: {val_sisdr:.2f} dB")
             
             if not args.debug:
                 wandb.log({
                     "val_loss": val_loss,
                     "val_sisdr": val_sisdr,
-                    "val_estoi": val_estoi,
                     "epoch": epoch + 1
                 })
             
-            # Save Checkpoint (Best)
+            # Log validation results to JSON file
+            val_json_path = os.path.join(args.checkpoint_dir, "val_results.json")
+            val_entry = {
+                "epoch": epoch + 1,
+                "phase": phase,
+                "val_loss": round(float(val_loss), 6),
+                "val_sisdr": round(float(val_sisdr), 4),
+                "train_loss": round(total_loss / max(len(train_loader), 1), 6),
+                "lambda_mel": lambda_mel,
+                "lambda_gan": lambda_gan,
+                "lambda_feat": lambda_feat,
+                "lr_g": optimizer_g.param_groups[0]['lr'],
+                "lr_d": optimizer_d.param_groups[0]['lr'],
+                "best_sisdr": round(float(best_sisdr), 4) if best_sisdr != -float('inf') else None,
+                "timestamp": datetime.now().isoformat()
+            }
+            # Load existing or create new
+            if os.path.exists(val_json_path):
+                with open(val_json_path, 'r') as f:
+                    val_history = json.load(f)
+            else:
+                val_history = []
+            val_history.append(val_entry)
+            with open(val_json_path, 'w') as f:
+                json.dump(val_history, f, indent=2)
+            print(f"  ✓ Validation logged to {val_json_path}")
+            
+            # Save best model
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 torch.save(model.state_dict(), os.path.join(args.checkpoint_dir, "best_model.pth"))
-                print("Saved Best Model.")
-
+                print("  ✓ Saved Best Model.")
+            
+            # Phase 6: step the LR schedulers
+            if phase == 6 and scheduler_g is not None:
+                scheduler_g.step(val_loss)
+                scheduler_d.step(val_loss)
         else:
-            print(f"Epoch {epoch+1} | Train Loss: {total_loss/len(train_loader):.4f} | Validation Skipped")
+            print(f"\nEpoch {epoch+1} [Phase {phase}] | "
+                  f"Train Loss: {total_loss/max(len(train_loader),1):.4f} | Validation Skipped")
             if not args.debug:
-                wandb.log({
-                    "epoch": epoch + 1
-                })
+                wandb.log({"epoch": epoch + 1})
         
-        # Save Latest Checkpoint (Every Epoch)
+        # =================================================================
+        # PHASE TRANSITIONS
+        # =================================================================
+        
+        # --- Phase 1 → 2: val MSE drops below 8.2 ---
+        if phase == 1 and val_loss is not None and val_loss < 8.2:
+            phase = 2
+            phase_epoch = 0
+            lambda_mel = 2.0
+            set_lr(optimizer_g, 1e-4)
+            best_sisdr = -float('inf')
+            sisdr_patience_counter = 0
+            print(f"\n{'='*60}")
+            print(f"[PHASE 1 → 2] Val MSE {val_loss:.4f} < 8.2")
+            print(f"  → LR set to 1e-4, lambda_mel starting at 2.0")
+            print(f"{'='*60}\n")
+        
+        # --- Phase 2: ramp lambda_mel, then watch SI-SDR ---
+        elif phase == 2:
+            phase_epoch += 1
+            
+            if lambda_mel < 13.0:
+                lambda_mel = min(lambda_mel + 1.0, 13.0)
+                print(f"  [Phase 2] lambda_mel → {lambda_mel:.0f}")
+            
+            # Once lambda_mel is at 13, start checking SI-SDR plateau
+            if lambda_mel >= 13.0 and val_sisdr is not None:
+                plateaued = check_sisdr_plateau(val_sisdr)
+                print(f"  [Phase 2] SI-SDR: {val_sisdr:.2f} | best: {best_sisdr:.2f} | patience: {sisdr_patience_counter}/3")
+                
+                if plateaued:
+                    phase = 3
+                    phase_epoch = 0
+                    set_lr(optimizer_g, 5e-5)
+                    best_sisdr = -float('inf')  # Reset for phase 3 tracking
+                    sisdr_patience_counter = 0
+                    print(f"\n{'='*60}")
+                    print(f"[PHASE 2 → 3] SI-SDR plateaued (patience exhausted)")
+                    print(f"  → LR reduced to 5e-5, continuing with lambda_mel=13")
+                    print(f"{'='*60}\n")
+        
+        # --- Phase 3: Continue until SI-SDR plateaus again ---
+        elif phase == 3:
+            phase_epoch += 1
+            
+            if val_sisdr is not None:
+                plateaued = check_sisdr_plateau(val_sisdr)
+                print(f"  [Phase 3] SI-SDR: {val_sisdr:.2f} | best: {best_sisdr:.2f} | patience: {sisdr_patience_counter}/3")
+                
+                if plateaued:
+                    phase = 4
+                    phase_epoch = 0
+                    
+                    # Freeze generator
+                    print(f"\n{'='*60}")
+                    print(f"[PHASE 3 → 4] SI-SDR plateaued again")
+                    print(f"  → Freezing generator, training discriminator for 4 epochs")
+                    print(f"  → Saving discriminator weights")
+                    print(f"{'='*60}\n")
+                    
+                    # Save discriminator initial weights
+                    torch.save(discriminator.state_dict(),
+                               os.path.join(args.checkpoint_dir, "disc_phase4_start.pth"))
+        
+        # --- Phase 4: Train disc for 4 epochs, then → 5 ---
+        elif phase == 4:
+            phase_epoch += 1
+            
+            # Save discriminator weights every epoch in phase 4
+            torch.save(discriminator.state_dict(),
+                       os.path.join(args.checkpoint_dir, "disc_latest.pth"))
+            print(f"  [Phase 4] Discriminator epoch {phase_epoch}/4 — disc weights saved")
+            
+            if phase_epoch >= 4:
+                phase = 5
+                phase_epoch = 0
+                lambda_gan = 0.5
+                lambda_feat = 1.0
+                
+                # Unfreeze generator
+                for p in model.parameters():
+                    p.requires_grad_(True)
+                
+                print(f"\n{'='*60}")
+                print(f"[PHASE 4 → 5] 4 disc epochs complete")
+                print(f"  → Unfreezing generator")
+                print(f"  → lambda_gan=0.5, lambda_feat=1.0 (will ramp)")
+                print(f"{'='*60}\n")
+        
+        # --- Phase 5: Ramp GAN lambdas, then → 6 ---
+        elif phase == 5:
+            phase_epoch += 1
+            
+            # Save disc weights every epoch
+            torch.save(discriminator.state_dict(),
+                       os.path.join(args.checkpoint_dir, "disc_latest.pth"))
+            
+            if lambda_gan < 1.0:
+                lambda_gan = min(lambda_gan + 0.1, 1.0)
+            if lambda_feat < 2.0:
+                lambda_feat = min(lambda_feat + 0.2, 2.0)
+            
+            print(f"  [Phase 5] lambda_gan → {lambda_gan:.2f}, lambda_feat → {lambda_feat:.2f}")
+            
+            # Transition once both are maxed
+            if lambda_gan >= 1.0 and lambda_feat >= 2.0:
+                phase = 6
+                phase_epoch = 0
+                
+                # Create LR schedulers for final convergence
+                scheduler_g = optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer_g, mode='min', factor=0.5, patience=5
+                )
+                scheduler_d = optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer_d, mode='min', factor=0.5, patience=5
+                )
+                
+                print(f"\n{'='*60}")
+                print(f"[PHASE 5 → 6] GAN lambdas fully ramped")
+                print(f"  → Holding lambda_gan=1.0, lambda_feat=2.0, lambda_mel=13")
+                print(f"  → Using ReduceLROnPlateau scheduler for convergence")
+                print(f"{'='*60}\n")
+        
+        # --- Phase 6: Final convergence (scheduler handles LR) ---
+        elif phase == 6:
+            phase_epoch += 1
+            
+            # Save disc weights every epoch
+            torch.save(discriminator.state_dict(),
+                       os.path.join(args.checkpoint_dir, "disc_latest.pth"))
+            
+            print(f"  [Phase 6] Converging — LR_G: {optimizer_g.param_groups[0]['lr']:.1e}, "
+                  f"LR_D: {optimizer_d.param_groups[0]['lr']:.1e}")
+        
+        # =================================================================
+        # SAVE FULL TRAINING STATE (every epoch)
+        # =================================================================
+        save_dict = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'discriminator_state_dict': discriminator.state_dict(),
+            'optimizer_g_state_dict': optimizer_g.state_dict(),
+            'optimizer_d_state_dict': optimizer_d.state_dict(),
+            'phase': phase,
+            'phase_epoch': phase_epoch,
+            'lambda_mel': lambda_mel,
+            'lambda_gan': lambda_gan,
+            'lambda_feat': lambda_feat,
+            'best_sisdr': best_sisdr,
+            'sisdr_patience_counter': sisdr_patience_counter,
+            'best_val_loss': best_val_loss,
+        }
+        if scheduler_g is not None:
+            save_dict['scheduler_g_state_dict'] = scheduler_g.state_dict()
+        if scheduler_d is not None:
+            save_dict['scheduler_d_state_dict'] = scheduler_d.state_dict()
+        
+        torch.save(save_dict, os.path.join(args.checkpoint_dir, "training_state.pth"))
+        
+        # Also save model-only checkpoint for easy loading
         torch.save(model.state_dict(), os.path.join(args.checkpoint_dir, "latest_model.pth"))
 
 def validate(model, loader, criterion, device, args):
     model.eval()
     total_loss = 0.0
     sisdr_scores = []
-    estoi_scores = []
     
-    # Import for metrics
     from scipy import signal
-    try:
-        from pystoi import stoi
-    except ImportError:
-        stoi = None
-    estoi_scores = []
     
-    # Import for metrics
-    from scipy import signal
-    try:
-        from pystoi import stoi
-    except ImportError:
-        stoi = None
-    
+    val_pbar = tqdm(loader, desc="Validating")
     with torch.no_grad():
-        for batch_idx, (noisy, eeg, clean) in enumerate(loader):
-            # ... (Existing Loading & Forward) ...
+        for batch_idx, (noisy, eeg, clean) in enumerate(val_pbar):
             noisy = noisy.to(device)
             clean = clean.to(device)
             eeg = eeg.to(device)
             
             if args.noise_cue:
-                # Replace EEG with Gaussian Noise matching statistics
                 eeg_mean = eeg.mean()
                 eeg_std = eeg.std()
                 eeg = torch.randn_like(eeg) * eeg_std + eeg_mean
@@ -397,26 +657,12 @@ def validate(model, loader, criterion, device, args):
             # 2. Model Forward (Z Pred)
             z_pred, _, _, _, _, env_pred = model(noisy, eeg)
             
-            # 3. Loss
+            # 3. Loss (MSE on latents)
             loss, _ = criterion(z_pred, z_target, env_pred, clean)
             total_loss += loss.item()
             
-            # 4. Neural Decoding & SI-SDR
-            # z_pred is (B, 1024, T)
-            # We need to quantize it and then decode?
-            # Or just decode directly if DAC supports unquantized Z decoding?
-            # Usually dac.decode(z) works on quantized Z. 
-            # Ideally we run it through quantizer to get discrete codes then decode.
-            # z_q, codes, _ = model.dac.quantizer(z_pred, n_quantizers=9) # Check API
-            
-            # DAC's Quantizer.from_latents(z) returns 5 values
+            # 4. Decode for SI-SDR
             z_q = model.dac.quantizer(z_pred, n_quantizers=9)[0]
-            # return self.quantize(z) which returns z_q, codes, latents
-            # But we might need exactly 9 layers.
-            
-            # Let's try direct decode first, assuming z_pred is close enough.
-            # But real inference handles quantization.
-            # model.dac.decode(z_q)
             pred_audio = model.dac.decode(z_q)
             
             # SI-SDR Calculation
@@ -427,13 +673,11 @@ def validate(model, loader, criterion, device, args):
             pred_np = pred_audio.cpu().numpy().squeeze(1)
             clean_np = clean_ref.cpu().numpy().squeeze(1)
             
-            # Handle Batch Dim if needed
             if pred_np.ndim == 1:
                 pred_np = pred_np[np.newaxis, :]
                 clean_np = clean_np[np.newaxis, :]
             
             batch_sisdr = []
-            batch_estoi = []
             
             for b in range(pred_np.shape[0]):
                 p = pred_np[b]
@@ -456,37 +700,31 @@ def validate(model, loader, criterion, device, args):
                 # SI-SDR
                 score = sisdr(c, p_aligned)
                 batch_sisdr.append(score)
-                
-                # ESTOI
-                if stoi is not None:
-                    # KUL: 16000, Cocktail: 44100
-                    if args.dataset == 'kul': fs = 16000
-                    else: fs = 44100
-                    
-                    try:
-                        e_val = stoi(c, p_aligned, fs, extended=True)
-                        batch_estoi.append(e_val)
-                    except Exception:
-                        pass
             
             sisdr_scores.extend(batch_sisdr)
-            estoi_scores.extend(batch_estoi)
+            
+            # Update progress bar with running stats
+            running_loss = total_loss / (batch_idx + 1)
+            running_sisdr = np.mean(sisdr_scores) if sisdr_scores else 0.0
+            val_pbar.set_postfix({
+                'loss': f"{running_loss:.4f}",
+                'sisdr': f"{running_sisdr:.2f}"
+            })
 
             if args.debug and batch_idx > 2:
                 break
                 
-    mean_loss = total_loss / len(loader)
+    mean_loss = total_loss / max(len(loader), 1)
     mean_sisdr = np.mean(sisdr_scores) if len(sisdr_scores) > 0 else 0.0
-    mean_estoi = np.mean(estoi_scores) if len(estoi_scores) > 0 else 0.0
     
-    return mean_loss, mean_sisdr, mean_estoi
+    return mean_loss, mean_sisdr
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root', type=str, default='/workspace/Dataset/kul_all_subjects.lmdb')
-    parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--root', type=str, default='/workspace/NeuroCodec/Dataset/kul_all_subjects.lmdb')
+    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--lr', type=float, default=3e-4, help="Initial learning rate (used in Phase 1)")
+    parser.add_argument('--epochs', type=int, default=200, help="Max total epochs across all phases")
     parser.add_argument('--hidden_dim', type=int, default=256) 
     parser.add_argument('--num_layers', type=int, default=4)
     parser.add_argument('--gpu', type=int, default=0)
@@ -500,15 +738,8 @@ if __name__ == "__main__":
     
     parser.add_argument('--backbone', type=str, default='mamba', choices=['mamba', 'transformer'], help='Backbone architecture')
     parser.add_argument('--activation', type=str, default='gelu', choices=['gelu', 'snake', 'relu'], help='Activation function (transformer only)')
-    parser.add_argument('--val_interval', type=int, default=2, help="Validation interval in epochs (default: 1)")
-    parser.add_argument('--lambda_mel', type=float, default=13.0, help="Weight for Mel Spectrogram Loss")
-    parser.add_argument('--mel_start_epoch', type=int, default=0, help="Epoch to start applying Mel Loss")
+    parser.add_argument('--val_interval', type=int, default=2, help="Validation interval in epochs (default: 2)")
     parser.add_argument('--val_batches', type=int, default=0, help="Limit number of validation batches (0 = full)")
-    
-    parser.add_argument('--lambda_gan', type=float, default=1.0, help="Weight for GAN Adversarial Loss")
-    parser.add_argument('--lambda_feat', type=float, default=2.0, help="Weight for GAN Feature Matching Loss")
-    parser.add_argument('--gan_start_epoch', type=int, default=0, help="Epoch to start GAN training")
-    parser.add_argument('--disc_warmup_epochs', type=int, default=3, help="Number of epochs to freeze Generator for Discriminator warmup")
     
     args = parser.parse_args()
     
@@ -531,12 +762,9 @@ if __name__ == "__main__":
                 subset='val', 
                 batch_size=args.batch_size, 
                 num_gpus=1, 
-                target_fs=16000, # Hardcoded or use args
-                original_fs=16000 # Correct FS
+                target_fs=16000,
+                original_fs=16000
              )
-             # args.eeg_channels should be set by user or we trust default?
-             # If user didn't set, default is 128 (wrong for KUL).
-             # We should probably force it here if it's default?
              if args.eeg_channels == 128 and args.dataset == 'kul':
                  print("Warning: Dataset is KUL but eeg_channels is 128. Assuming user wants 64 (Autofix).")
                  args.eeg_channels = 64
@@ -557,16 +785,14 @@ if __name__ == "__main__":
         
         if os.path.exists(checkpoint_path):
             print(f"Loading checkpoint {checkpoint_path}...")
-            # Use weights_only=False to avoid future warnings if safe, or handle pickle security
             model.load_state_dict(torch.load(checkpoint_path, map_location=device))
         else:
             print(f"No checkpoint found at {checkpoint_path}! Running with random weights.")
             
-        # Use NeuroCodecLoss for compatibility with validate() function signature
         criterion = NeuroCodecLoss(lambda_recon=1.0, lambda_env=0.0).to(device)
         
-        val_loss, val_sisdr, val_estoi = validate(model, val_loader, criterion, device, args)
-        print(f"Validation Result | Loss: {val_loss:.4f} | SI-SDR: {val_sisdr:.2f} dB | ESTOI: {val_estoi:.4f}")
+        val_loss, val_sisdr = validate(model, val_loader, criterion, device, args)
+        print(f"Validation Result | Loss: {val_loss:.4f} | SI-SDR: {val_sisdr:.2f} dB")
         
     else:
         train(args)

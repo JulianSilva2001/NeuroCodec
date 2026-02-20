@@ -36,3 +36,12 @@ experiments/
 
 # Compiled extensions
 *.so
+
+#Dataset
+Dataset/
+KUL-mix/
+KUL-mix/KUL_eeg
+
+
+
+
