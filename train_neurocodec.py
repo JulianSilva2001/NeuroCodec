@@ -161,6 +161,28 @@ def train(args):
     best_val_loss = float('inf')
     start_epoch = 0
     
+    # =========================================================================
+    # HELPER: Set LR for all param groups
+    # =========================================================================
+    def set_lr(optimizer, lr):
+        for pg in optimizer.param_groups:
+            pg['lr'] = lr
+    
+    # =========================================================================
+    # HELPER: Check SI-SDR plateau
+    # =========================================================================
+    def check_sisdr_plateau(current_sisdr):
+        nonlocal best_sisdr, sisdr_patience_counter
+        if current_sisdr > best_sisdr:
+            best_sisdr = current_sisdr
+            sisdr_patience_counter = 0
+            return False  # Not plateaued
+        else:
+            sisdr_patience_counter += 1
+            if sisdr_patience_counter >= 3:
+                return True  # Plateaued
+            return False
+    
     # 5. Load checkpoint if exists (resume training)
     checkpoint_path = os.path.join(args.checkpoint_dir, "training_state.pth")
     if os.path.exists(checkpoint_path):
@@ -168,9 +190,12 @@ def train(args):
         try:
             ckpt = torch.load(checkpoint_path, map_location=device)
             model.load_state_dict(ckpt['model_state_dict'])
-            discriminator.load_state_dict(ckpt['discriminator_state_dict'])
-            optimizer_g.load_state_dict(ckpt['optimizer_g_state_dict'])
-            optimizer_d.load_state_dict(ckpt['optimizer_d_state_dict'])
+            if ckpt.get('discriminator_state_dict'):
+                discriminator.load_state_dict(ckpt['discriminator_state_dict'])
+            if ckpt.get('optimizer_g_state_dict'):
+                optimizer_g.load_state_dict(ckpt['optimizer_g_state_dict'])
+            if ckpt.get('optimizer_d_state_dict'):
+                optimizer_d.load_state_dict(ckpt['optimizer_d_state_dict'])
             phase = ckpt.get('phase', 1)
             phase_epoch = ckpt.get('phase_epoch', 0)
             lambda_mel = ckpt.get('lambda_mel', 0.0)
@@ -197,6 +222,14 @@ def train(args):
             print(f"Resumed at epoch {start_epoch}, Phase {phase}, phase_epoch {phase_epoch}")
             print(f"  lambda_mel={lambda_mel:.1f}, lambda_gan={lambda_gan:.2f}, lambda_feat={lambda_feat:.2f}")
             print(f"  best_sisdr={best_sisdr:.2f}, patience={sisdr_patience_counter}")
+            
+            # Set correct LR for the resumed phase
+            if phase == 2:
+                set_lr(optimizer_g, 1e-4)
+                print(f"  LR_G set to 1e-4 for Phase 2")
+            elif phase >= 3 and phase <= 5:
+                set_lr(optimizer_g, 5e-5)
+                print(f"  LR_G set to 5e-5 for Phase {phase}")
         except Exception as e:
             print(f"Failed to load checkpoint: {e}. Starting from scratch.")
             start_epoch = 0
@@ -214,27 +247,6 @@ def train(args):
         else:
             print("No existing checkpoint found. Starting from scratch.")
     
-    # =========================================================================
-    # HELPER: Set LR for all param groups
-    # =========================================================================
-    def set_lr(optimizer, lr):
-        for pg in optimizer.param_groups:
-            pg['lr'] = lr
-    
-    # =========================================================================
-    # HELPER: Check SI-SDR plateau
-    # =========================================================================
-    def check_sisdr_plateau(current_sisdr):
-        nonlocal best_sisdr, sisdr_patience_counter
-        if current_sisdr > best_sisdr:
-            best_sisdr = current_sisdr
-            sisdr_patience_counter = 0
-            return False  # Not plateaued
-        else:
-            sisdr_patience_counter += 1
-            if sisdr_patience_counter >= 3:
-                return True  # Plateaued
-            return False
     
     # =========================================================================
     # TRAINING LOOP
@@ -334,6 +346,7 @@ def train(args):
                 # 2. Mel Spectrogram Loss
                 if use_mel and lambda_mel > 0:
                     mel_loss = mel_loss_fn(pred_audio, clean_aligned)
+                    mel_loss = torch.clamp(mel_loss, max=100.0)  # Prevent explosion
                     recon_loss += lambda_mel * mel_loss
                     loss_dict['loss_mel'] = mel_loss.item()
                 else:
@@ -347,6 +360,12 @@ def train(args):
                     loss_dict['loss_adv'] = g_loss_adv.item()
                     loss_dict['loss_feat'] = g_loss_feat.item()
                     total_g_loss += g_loss_adv.item() + g_loss_feat.item()
+                
+                # Guard: skip batch if loss is NaN/Inf/exploded
+                if torch.isnan(recon_loss) or torch.isinf(recon_loss) or recon_loss.item() > 1e6:
+                    print(f"  ⚠ Skipping batch {batch_idx}: loss={recon_loss.item():.2e}")
+                    optimizer_g.zero_grad()
+                    continue
                 
                 recon_loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -472,7 +491,7 @@ def train(args):
         # =================================================================
         
         # --- Phase 1 → 2: val MSE drops below 8.2 ---
-        if phase == 1 and val_loss is not None and val_loss < 8.2:
+        if phase == 1 and val_loss is not None and val_loss < 8.6:
             phase = 2
             phase_epoch = 0
             lambda_mel = 2.0
@@ -480,7 +499,7 @@ def train(args):
             best_sisdr = -float('inf')
             sisdr_patience_counter = 0
             print(f"\n{'='*60}")
-            print(f"[PHASE 1 → 2] Val MSE {val_loss:.4f} < 8.2")
+            print(f"[PHASE 1 → 2] Val MSE {val_loss:.4f} < 8.6")
             print(f"  → LR set to 1e-4, lambda_mel starting at 2.0")
             print(f"{'='*60}\n")
         
@@ -489,7 +508,7 @@ def train(args):
             phase_epoch += 1
             
             if lambda_mel < 13.0:
-                lambda_mel = min(lambda_mel + 1.0, 13.0)
+                lambda_mel = min(lambda_mel + 0.5, 13.0)
                 print(f"  [Phase 2] lambda_mel → {lambda_mel:.0f}")
             
             # Once lambda_mel is at 13, start checking SI-SDR plateau
@@ -578,10 +597,10 @@ def train(args):
                 
                 # Create LR schedulers for final convergence
                 scheduler_g = optim.lr_scheduler.ReduceLROnPlateau(
-                    optimizer_g, mode='min', factor=0.5, patience=5
+                    optimizer_g, mode='min', factor=0.5, patience=3
                 )
                 scheduler_d = optim.lr_scheduler.ReduceLROnPlateau(
-                    optimizer_d, mode='min', factor=0.5, patience=5
+                    optimizer_d, mode='min', factor=0.5, patience=3
                 )
                 
                 print(f"\n{'='*60}")
@@ -722,8 +741,8 @@ def validate(model, loader, criterion, device, args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', type=str, default='/workspace/NeuroCodec/Dataset/kul_all_subjects.lmdb')
-    parser.add_argument('--batch_size', type=int, default=4)
-    parser.add_argument('--lr', type=float, default=3e-4, help="Initial learning rate (used in Phase 1)")
+    parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--lr', type=float, default=1e-3, help="Initial learning rate (used in Phase 1)")
     parser.add_argument('--epochs', type=int, default=200, help="Max total epochs across all phases")
     parser.add_argument('--hidden_dim', type=int, default=256) 
     parser.add_argument('--num_layers', type=int, default=4)

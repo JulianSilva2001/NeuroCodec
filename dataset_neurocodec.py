@@ -158,7 +158,7 @@ def load_NeuroCodecDataset(root, subset='train', batch_size=4, num_gpus=1, shuff
         dataset,
         batch_size=batch_size,
         shuffle=shuffle, # Use the determined variable
-        num_workers=4,
+        num_workers=16,
         sampler=sampler,
         pin_memory=True
     )
@@ -357,7 +357,7 @@ def load_KUL_NeuroCodecDataset(lmdb_path, subset='train', batch_size=4, num_gpus
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=4,
+        num_workers=16,
         sampler=sampler,
         pin_memory=True
     )
