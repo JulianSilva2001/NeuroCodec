@@ -6,11 +6,27 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import wandb
 import numpy as np
 import dac.model  # Added this import
+import dac.nn.layers
+
+# Monkey-patch: replace JIT-compiled Snake with plain Python version
+# (JIT snake is incompatible with torch.utils.checkpoint — produces
+#  inconsistent internal tensor metadata on recomputation)
+def _snake_no_jit(x, alpha):
+    shape = x.shape
+    x = x.reshape(shape[0], shape[1], -1)
+    x = x + (alpha + 1e-9).reciprocal() * torch.sin(alpha * x).pow(2)
+    x = x.reshape(shape)
+    return x
+
+dac.nn.layers.snake = _snake_no_jit
+# Also patch the class method so existing instances use the new function
+dac.nn.layers.Snake1d.forward = lambda self, x: _snake_no_jit(x, self.alpha)
 
 # Local imports
 from models.neurocodec import NeuroCodec
@@ -74,24 +90,26 @@ def train(args):
         dac_model_type = '44khz'
         target_fs = 44100
 
+    # Initial batch size comes from phase 1 default (will be adjusted on resume)
+    init_batch_size = args.batch_size  # placeholder; overridden below after phase is known
     if args.dataset == 'cocktail':
          train_loader = load_NeuroCodecDataset(
             root=args.root, 
             subset='train', 
-            batch_size=args.batch_size,
+            batch_size=init_batch_size,
             num_gpus=1
         )
          val_loader = load_NeuroCodecDataset(
             root=args.root, 
             subset='val', 
-            batch_size=args.batch_size, 
+            batch_size=init_batch_size, 
             num_gpus=1
         )
     elif args.dataset == 'kul':
          train_loader = load_KUL_NeuroCodecDataset(
             lmdb_path=args.root,
             subset='train',
-            batch_size=args.batch_size,
+            batch_size=init_batch_size,
             num_gpus=1,
             target_fs=target_fs,
             original_fs=16000
@@ -99,7 +117,7 @@ def train(args):
          val_loader = load_KUL_NeuroCodecDataset(
             lmdb_path=args.root,
             subset='val',
-            batch_size=args.batch_size,
+            batch_size=init_batch_size,
             num_gpus=1,
             target_fs=target_fs,
             original_fs=16000
@@ -143,13 +161,36 @@ def train(args):
     # =========================================================================
     # MULTI-PHASE STATE MACHINE
     # =========================================================================
-    # Phase 1: MSE only
-    # Phase 2: MSE + Mel (LR -> 1e-4, lambda_mel ramps 2->13)
-    # Phase 3: MSE + Mel (lambda_mel=13, LR -> 5e-5), until SI-SDR plateaus
-    # Phase 4: Freeze generator, train discriminator only for 4 epochs
-    # Phase 5: Unfreeze, ramp GAN lambdas (lambda_gan 0.5->1.0, lambda_feat 1.0->2.0)
-    # Phase 6: Hold all lambdas, use ReduceLROnPlateau scheduler
+    # Phase 1: MSE only                                           (batch_size=64)
+    # Phase 2: MSE + Mel (LR -> 1e-4, lambda_mel ramps 2->13)    (batch_size=16)
+    # Phase 3: MSE + Mel (lambda_mel=13, LR -> 5e-5), plateau    (batch_size=16)
+    # Phase 4: Freeze generator, train discriminator 4 epochs     (batch_size=8)
+    # Phase 5: Unfreeze, ramp GAN lambdas                         (batch_size=8)
+    # Phase 6: Hold all lambdas, ReduceLROnPlateau scheduler       (batch_size=8)
     # =========================================================================
+    
+    PHASE_BATCH_SIZE = {1: 64, 2: 8, 3: 8, 4: 8, 5: 8, 6: 8}
+    
+    def rebuild_loaders(bs):
+        """Rebuild train/val DataLoaders with a new batch size."""
+        nonlocal train_loader, val_loader
+        print(f"  → Rebuilding DataLoaders with batch_size={bs}")
+        if args.dataset == 'cocktail':
+            train_loader = load_NeuroCodecDataset(
+                root=args.root, subset='train', batch_size=bs, num_gpus=1
+            )
+            val_loader = load_NeuroCodecDataset(
+                root=args.root, subset='val', batch_size=bs, num_gpus=1
+            )
+        elif args.dataset == 'kul':
+            train_loader = load_KUL_NeuroCodecDataset(
+                lmdb_path=args.root, subset='train', batch_size=bs,
+                num_gpus=1, target_fs=target_fs, original_fs=16000
+            )
+            val_loader = load_KUL_NeuroCodecDataset(
+                lmdb_path=args.root, subset='val', batch_size=bs,
+                num_gpus=1, target_fs=target_fs, original_fs=16000
+            )
     
     phase = 1
     phase_epoch = 0          # epoch counter within current phase
@@ -251,8 +292,12 @@ def train(args):
     # =========================================================================
     # TRAINING LOOP
     # =========================================================================
+    # Rebuild DataLoaders with the correct batch size for the current phase
+    current_bs = PHASE_BATCH_SIZE.get(phase, 8)
+    rebuild_loaders(current_bs)
+    
     print(f"\n{'='*60}")
-    print(f"Starting training at Phase {phase}")
+    print(f"Starting training at Phase {phase} (batch_size={current_bs})")
     print(f"{'='*60}\n")
     
     for epoch in range(start_epoch, args.epochs):
@@ -319,8 +364,11 @@ def train(args):
             
             # Quantize & decode for mel/GAN losses
             if use_mel or use_gan or train_discriminator:
+                torch.cuda.empty_cache()
                 z_q, _, _, _, _ = model.dac.quantizer(z_pred, n_quantizers=9)
-                pred_audio = model.dac.decode(z_q)
+                pred_audio = grad_checkpoint(
+                    model.dac.decode, z_q, use_reentrant=False
+                )
                 
                 min_len = min(pred_audio.shape[-1], clean.shape[-1])
                 pred_audio = pred_audio[..., :min_len]
@@ -491,16 +539,18 @@ def train(args):
         # =================================================================
         
         # --- Phase 1 → 2: val MSE drops below 8.2 ---
-        if phase == 1 and val_loss is not None and val_loss < 8.6:
+        if phase == 1 and val_loss is not None and val_loss < 8.8:
             phase = 2
             phase_epoch = 0
-            lambda_mel = 2.0
+            lambda_mel = 1.0
             set_lr(optimizer_g, 1e-4)
             best_sisdr = -float('inf')
             sisdr_patience_counter = 0
+            rebuild_loaders(PHASE_BATCH_SIZE[2])
             print(f"\n{'='*60}")
-            print(f"[PHASE 1 → 2] Val MSE {val_loss:.4f} < 8.6")
+            print(f"[PHASE 1 → 2] Val MSE {val_loss:.4f} < 8.8")
             print(f"  → LR set to 1e-4, lambda_mel starting at 2.0")
+            print(f"  → batch_size → {PHASE_BATCH_SIZE[2]}")
             print(f"{'='*60}\n")
         
         # --- Phase 2: ramp lambda_mel, then watch SI-SDR ---
@@ -508,7 +558,7 @@ def train(args):
             phase_epoch += 1
             
             if lambda_mel < 13.0:
-                lambda_mel = min(lambda_mel + 0.5, 13.0)
+                lambda_mel = min(lambda_mel + 0.25, 10.0)
                 print(f"  [Phase 2] lambda_mel → {lambda_mel:.0f}")
             
             # Once lambda_mel is at 13, start checking SI-SDR plateau
@@ -522,6 +572,7 @@ def train(args):
                     set_lr(optimizer_g, 5e-5)
                     best_sisdr = -float('inf')  # Reset for phase 3 tracking
                     sisdr_patience_counter = 0
+                    # batch_size stays at 16 (same as phase 2), no rebuild needed
                     print(f"\n{'='*60}")
                     print(f"[PHASE 2 → 3] SI-SDR plateaued (patience exhausted)")
                     print(f"  → LR reduced to 5e-5, continuing with lambda_mel=13")
@@ -538,12 +589,14 @@ def train(args):
                 if plateaued:
                     phase = 4
                     phase_epoch = 0
+                    rebuild_loaders(PHASE_BATCH_SIZE[4])
                     
                     # Freeze generator
                     print(f"\n{'='*60}")
                     print(f"[PHASE 3 → 4] SI-SDR plateaued again")
                     print(f"  → Freezing generator, training discriminator for 4 epochs")
                     print(f"  → Saving discriminator weights")
+                    print(f"  → batch_size → {PHASE_BATCH_SIZE[4]}")
                     print(f"{'='*60}\n")
                     
                     # Save discriminator initial weights
@@ -740,7 +793,7 @@ def validate(model, loader, criterion, device, args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root', type=str, default='/workspace/NeuroCodec/Dataset/kul_all_subjects.lmdb')
+    parser.add_argument('--root', type=str, default='/workspace/KUL-mix/KUL_eeg/kul_all_subjects.lmdb')
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--lr', type=float, default=1e-3, help="Initial learning rate (used in Phase 1)")
     parser.add_argument('--epochs', type=int, default=200, help="Max total epochs across all phases")
