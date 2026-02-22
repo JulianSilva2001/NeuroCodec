@@ -38,6 +38,20 @@ import matplotlib.pyplot as plt
 
 from models.neurocodec_online import OnlineNeuroCodec
 from dataset_neurocodec import load_NeuroCodecDataset
+
+try:
+    from pystoi import stoi as _stoi
+    HAS_STOI = True
+except ImportError:
+    HAS_STOI = False
+    print("WARNING: pystoi not installed — ESTOI will be skipped. pip install pystoi")
+
+try:
+    from pesq import pesq as _pesq
+    HAS_PESQ = True
+except ImportError:
+    HAS_PESQ = False
+    print("WARNING: pesq not installed  — PESQ will be skipped. pip install pesq")
 try:
     from dataset_neurocodec import load_KUL_NeuroCodecDataset
 except ImportError:
@@ -47,6 +61,37 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def compute_estoi(ref: np.ndarray, deg: np.ndarray, sr: int):
+    """Extended STOI in [0, 1]. Returns None if pystoi is not installed."""
+    if not HAS_STOI:
+        return None
+    try:
+        return float(_stoi(ref, deg, sr, extended=True))
+    except Exception:
+        return None
+
+
+def compute_pesq(ref: np.ndarray, deg: np.ndarray, sr: int):
+    """
+    PESQ MOS-LQO score (wideband, ~1.0–4.5).
+    PESQ only accepts 8 kHz or 16 kHz — audio is resampled if needed.
+    Returns None if pesq is not installed or computation fails.
+    """
+    if not HAS_PESQ:
+        return None
+    try:
+        pesq_sr = 16000
+        if sr != pesq_sr:
+            from math import gcd
+            from scipy.signal import resample_poly
+            g = gcd(sr, pesq_sr)
+            ref = resample_poly(ref, pesq_sr // g, sr // g).astype(np.float32)
+            deg = resample_poly(deg, pesq_sr // g, sr // g).astype(np.float32)
+        return float(_pesq(pesq_sr, ref, deg, 'wb'))
+    except Exception:
+        return None
+
 
 def rms(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """Root-mean-square along the last dimension. Returns a scalar tensor."""
@@ -147,15 +192,37 @@ class OnlineInferenceEngine:
             [self.eeg_buffer[:, :, self.eeg_hop:], new_eeg], dim=2
         )
 
-        # 3. Model inference — pass latent past directly (no DAC encode of past needed)
+        # 3. Model inference
+        # Hop 0: two-pass cold start — mirrors training exactly.
+        #   Pass 1: EEG-only (no speaker) → pseudo_past_z
+        #   Pass 2: speaker encoder ON with pseudo_past_z + reuse z_mix from Pass 1
+        # Hop 1+: single forward with real accumulated past_z.
+        is_cold_start = len(self.hop_times) == 0
         with torch.no_grad():
-            z_pred, _, _, _ = self.model(
-                self.audio_buffer,
-                self.eeg_buffer,
-                past_speech=None,
-                force_no_speaker=False,
-                past_z=self.past_z,
-            )
+            if is_cold_start:
+                z_p1, _, z_mix_h, _ = self.model(
+                    self.audio_buffer,
+                    self.eeg_buffer,
+                    past_speech=None,
+                    force_no_speaker=True,
+                )
+                pseudo_past_z = z_p1[:, :, -self.hop_dac:]
+                z_pred, _, _, _ = self.model(
+                    self.audio_buffer,
+                    self.eeg_buffer,
+                    past_speech=None,
+                    force_no_speaker=False,
+                    past_z=pseudo_past_z,
+                    z_mix_precomputed=z_mix_h,
+                )
+            else:
+                z_pred, _, _, _ = self.model(
+                    self.audio_buffer,
+                    self.eeg_buffer,
+                    past_speech=None,
+                    force_no_speaker=False,
+                    past_z=self.past_z,
+                )
             output_full = self.model.decode_audio(z_pred)   # (1, 1, T_out) — required for audio stream
 
         # 4. Take last hop_samples from decoded output
@@ -167,10 +234,15 @@ class OnlineInferenceEngine:
             output_hop = F.pad(output_full, (self.hop_samples - T_out, 0))
 
         # 5. Inference Normalization — match output RMS to input RMS (audio stream only)
+        # Threshold: only normalize if the model is producing meaningful output
+        # (out_rms > 1% of in_rms). During warmup the model may output near-silence;
+        # dividing by a tiny out_rms would massively amplify floor noise.
+        # Cap at 3.0x to prevent extreme boosts even when the threshold is met.
         in_rms  = rms(new_audio)
         out_rms = rms(output_hop)
-        if out_rms > 1e-8:
-            output_hop = output_hop * (in_rms / out_rms)
+        if out_rms > 0.01 * in_rms:
+            scale      = torch.clamp(in_rms / out_rms, max=3.0)
+            output_hop = output_hop * scale
 
         # 6. Update auditory attractor in latent space with EMA smoothing.
         #    Using z_pred[:, :, -hop_dac:] directly avoids the old problem where
@@ -414,6 +486,10 @@ def evaluate_online(args):
 
     sisdr_online   = []
     sisdr_input    = []
+    estoi_online   = []
+    estoi_input    = []
+    pesq_online    = []
+    pesq_input     = []
 
     for sample_idx, (noisy, eeg, clean) in enumerate(
         tqdm(test_loader, desc="Online inference")
@@ -437,8 +513,19 @@ def evaluate_online(args):
         sdr_out = sisdr_np(cln_np, out_np)
         sdr_in  = sisdr_np(cln_np, nsy_np)
 
+        estoi_out = compute_estoi(cln_np, out_np, sr)
+        estoi_in  = compute_estoi(cln_np, nsy_np, sr)
+        pesq_out  = compute_pesq(cln_np, out_np, sr)
+        pesq_in   = compute_pesq(cln_np, nsy_np, sr)
+
         sisdr_online.append(sdr_out)
         sisdr_input.append(sdr_in)
+        if estoi_out is not None:
+            estoi_online.append(estoi_out)
+            estoi_input.append(estoi_in)
+        if pesq_out is not None:
+            pesq_online.append(pesq_out)
+            pesq_input.append(pesq_in)
 
         # ── Per-hop SI-SDR (shows cold-start warmup) ───────────────────────
         hop_sisdrs = []
@@ -450,11 +537,14 @@ def evaluate_online(args):
                 break
             hop_sisdrs.append(sisdr_np(cln_np[h0:h1], out_np[h0:h1]))
 
+        estoi_str = (f"  ESTOI {estoi_in:.3f} → {estoi_out:.3f}  (Δ {estoi_out - estoi_in:+.3f})"
+                     if estoi_out is not None else "")
+        pesq_str  = (f"  PESQ {pesq_in:.2f} → {pesq_out:.2f}  (Δ {pesq_out - pesq_in:+.2f})"
+                     if pesq_out is not None else "")
         print(
             f"  Sample {sample_idx+1:3d} | "
-            f"Input SI-SDR {sdr_in:+.2f} dB → "
-            f"Online SI-SDR {sdr_out:+.2f} dB  "
-            f"(Δ {sdr_out - sdr_in:+.2f} dB)"
+            f"SI-SDR {sdr_in:+.2f} → {sdr_out:+.2f} dB  (Δ {sdr_out - sdr_in:+.2f} dB)"
+            f"{estoi_str}{pesq_str}"
         )
 
         # ── Save audio ─────────────────────────────────────────────────────
@@ -477,12 +567,22 @@ def evaluate_online(args):
             )
 
     if sisdr_online:
-        print(
-            f"\nResults over {len(sisdr_online)} samples:\n"
-            f"  Mean Input  SI-SDR : {np.mean(sisdr_input):.2f} dB\n"
-            f"  Mean Online SI-SDR : {np.mean(sisdr_online):.2f} dB\n"
-            f"  Mean Improvement   : {np.mean(np.array(sisdr_online) - np.array(sisdr_input)):.2f} dB"
-        )
+        lines = [
+            f"\nResults over {len(sisdr_online)} samples:",
+            f"  SI-SDR  | Input {np.mean(sisdr_input):.2f} dB  →  Output {np.mean(sisdr_online):.2f} dB"
+            f"  (Δ {np.mean(np.array(sisdr_online) - np.array(sisdr_input)):+.2f} dB)",
+        ]
+        if estoi_online:
+            lines.append(
+                f"  ESTOI   | Input {np.mean(estoi_input):.3f}      →  Output {np.mean(estoi_online):.3f}"
+                f"  (Δ {np.mean(np.array(estoi_online) - np.array(estoi_input)):+.3f})"
+            )
+        if pesq_online:
+            lines.append(
+                f"  PESQ    | Input {np.mean(pesq_input):.2f}       →  Output {np.mean(pesq_online):.2f}"
+                f"  (Δ {np.mean(np.array(pesq_online) - np.array(pesq_input)):+.2f})"
+            )
+        print("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------

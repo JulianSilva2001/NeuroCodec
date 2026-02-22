@@ -68,9 +68,16 @@ class SpeakerEncoder(nn.Module):
 
 class OnlineNeuroCodecBlock(nn.Module):
     """
-    One fusion layer. The audio features act as Query; the EEG neuronal
-    attractor and (optionally) the speaker auditory attractor are
-    concatenated to form a unified Key/Value for cross-attention.
+    One fusion layer combining EEG cross-attention and speaker conditioning.
+
+    EEG neuronal attractor → cross-attention Key/Value (audio attends to EEG).
+    Speaker auditory attractor → FiLM conditioning on the pre-norm attention query.
+      x_norm = ln1(x)                                 ← already unit-scale
+      x_norm = (1 + gamma) * x_norm + beta            ← FiLM on unit-scale features
+      (gamma, beta) = spk_film(mean(speaker_kv))
+      FiLM shapes what the audio "attends to" in EEG (modulates the query) and
+      is stable because ln1 normalizes the features before gamma is applied.
+      Gradient always flows here regardless of attention weights.
 
     x:          (B, T_audio, H)   audio query
     eeg_kv:     (B, T_eeg,   H)   neuronal attractor  (from EEG encoder)
@@ -88,7 +95,18 @@ class OnlineNeuroCodecBlock(nn.Module):
     ):
         super().__init__()
 
-        # --- Cross-Attention ---
+        # --- Speaker FiLM conditioning ---
+        # Projects mean-pooled speaker embedding to (gamma, beta) pairs —
+        # one scale and one shift per hidden dimension.
+        # Applied AFTER ln1 so x is unit-scale; prevents explosion even when
+        # gamma grows large after the first gradient update.
+        # x_norm = (1 + gamma) * ln1(x) + beta   (see forward)
+        # Zero-init: gamma=0 and beta=0 at start → exact identity on ln1(x).
+        self.spk_film = nn.Linear(hidden_dim, hidden_dim * 2)
+        nn.init.zeros_(self.spk_film.weight)
+        nn.init.zeros_(self.spk_film.bias)
+
+        # --- Cross-Attention (EEG only in Key/Value) ---
         self.ln1  = nn.LayerNorm(hidden_dim)
         self.attn = nn.MultiheadAttention(
             embed_dim=hidden_dim, num_heads=n_heads,
@@ -110,15 +128,19 @@ class OnlineNeuroCodecBlock(nn.Module):
         eeg_kv:     torch.Tensor,
         speaker_kv: torch.Tensor | None = None,
     ):
-        # Merge attractors → unified Key/Value
+        # Cross-Attention with EEG Key/Value + optional speaker FiLM on query.
+        # FiLM is applied AFTER ln1 so features are unit-scale — prevents the
+        # (1+gamma)*x explosion that occurs when x is pre-scaled by sqrt(H).
+        #   gamma > 0 → amplify feature dimension   (speaker-relevant)
+        #   gamma < 0 → suppress feature dimension  (speaker-irrelevant)
+        #   beta      → shift mean                  (identity bias)
+        # Gradient always flows here regardless of attention weights.
+        x_norm = self.ln1(x)
         if speaker_kv is not None:
-            kv = torch.cat([eeg_kv, speaker_kv], dim=1)   # (B, T_eeg+T_spk, H)
-        else:
-            kv = eeg_kv                                    # (B, T_eeg, H)
-
-        # Cross-Attention with residual
-        x_norm   = self.ln1(x)
-        attn_out, attn_w = self.attn(query=x_norm, key=kv, value=kv)
+            spk_summary = speaker_kv.mean(dim=1, keepdim=True)         # (B, 1, H)
+            gamma, beta = self.spk_film(spk_summary).chunk(2, dim=-1)  # each (B, 1, H)
+            x_norm = (1.0 + gamma) * x_norm + beta                     # FiLM on unit-scale query
+        attn_out, attn_w = self.attn(query=x_norm, key=eeg_kv, value=eeg_kv)
         x = x + self.drop1(attn_out)
 
         # Mamba with residual
@@ -156,6 +178,7 @@ class OnlineNeuroCodec(nn.Module):
         eeg_in_channels:      int   = 128,
         hidden_dim:           int   = 256,
         num_layers:           int   = 4,
+        dropout:              float = 0.1,
         speaker_dropout_prob: float = 0.2,
     ):
         super().__init__()
@@ -188,7 +211,7 @@ class OnlineNeuroCodec(nn.Module):
 
         # ── 5. Stacked fusion blocks ─────────────────────────────────────────
         self.layers = nn.ModuleList([
-            OnlineNeuroCodecBlock(hidden_dim=hidden_dim, dropout=0.3)
+            OnlineNeuroCodecBlock(hidden_dim=hidden_dim, dropout=dropout)
             for _ in range(num_layers)
         ])
 
