@@ -26,7 +26,8 @@ from tqdm import tqdm
 import numpy as np
 
 from models.neurocodec_online import OnlineNeuroCodec
-from losses import MelSpectrogramLoss
+import dac.model
+from losses import MelSpectrogramLoss, GANLoss
 from dataset_neurocodec import load_NeuroCodecDataset
 try:
     from dataset_neurocodec import load_KUL_NeuroCodecDataset
@@ -157,6 +158,12 @@ def sliding_window_train_step(
     device:         torch.device,
     lambda_latent:  float = 1.0,    # weight for latent MSE
     lambda_mel:     float = 0.1,    # weight for Mel perceptual loss
+    # GAN options (disabled by default)
+    gan_loss_fn:     nn.Module = None,  # GANLoss wrapper
+    lambda_gan:      float = 1.0,       # weight for adversarial loss
+    lambda_feat:     float = 2.0,       # weight for feature-matching loss
+    use_gan:         bool  = False,     # enable GAN losses this epoch
+    train_generator: bool  = True,      # False during discriminator warm-up epochs
 ):
     """
     Exactly replicates inference dynamics in training.
@@ -204,6 +211,7 @@ def sliding_window_train_step(
     past_z    = torch.zeros(B, 1024, hop_dac, device=device)
 
     total_loss_val = 0.0   # float — for logging only; backward is done per hop
+    total_d_loss   = 0.0   # discriminator loss accumulator (logging only)
     speaker_steps  = 0
     pseudo_rms     = 0.0
 
@@ -260,19 +268,37 @@ def sliding_window_train_step(
         # Latent MSE
         mse_loss_h = criterion(z_pred_last, z_target_h)
 
-        # Mel perceptual loss — decode z_pred_last through the frozen DAC decoder.
-        # No torch.no_grad() and no .detach() here: gradients from the Mel loss
-        # flow backward through the frozen decoder ops into z_pred_last, and from
-        # there back into the trainable OnlineNeuroCodecBlock / SpeakerEncoder.
-        # The decoder's own weights are already frozen (requires_grad=False),
-        # so they don't accumulate gradients — only the latent input does.
-        if lambda_mel > 0.0:
-            y_hat      = model.dac.decode(z_pred_last)     # (B, 1, T_decoded)
-            clean_hop  = clean[:, :, a0:a1]                # (B, 1, hop_samples)
-            mel_loss_h = mel_criterion(y_hat, clean_hop)
-            hop_loss   = lambda_latent * mse_loss_h + lambda_mel * mel_loss_h
-        else:
-            hop_loss = mse_loss_h
+        # Perceptual (Mel) and GAN losses both operate on decoded audio.
+        # Decode z_pred_last through the frozen DAC decoder once if either is active.
+        # No torch.no_grad() / .detach() on z_pred_last: gradients flow backward
+        # through the frozen decoder ops into z_pred_last and then into the trainable
+        # blocks. The decoder's own weights are frozen (requires_grad=False) so they
+        # don't accumulate gradients — only the latent input does.
+        hop_loss = lambda_latent * mse_loss_h
+
+        if lambda_mel > 0.0 or use_gan:
+            y_hat     = model.dac.decode(z_pred_last)      # (B, 1, T_decoded)
+            clean_hop = clean[:, :, a0:a1]                 # (B, 1, hop_samples)
+            # Trim to same length (DAC stride may add a few extra samples)
+            min_len   = min(y_hat.shape[-1], clean_hop.shape[-1])
+            y_hat     = y_hat[...,     :min_len]
+            clean_hop = clean_hop[..., :min_len]
+
+            if lambda_mel > 0.0:
+                hop_loss = hop_loss + lambda_mel * mel_criterion(y_hat, clean_hop)
+
+            if use_gan:
+                # ── Discriminator step (accumulate D grads across hops) ──────
+                # y_hat is detached so D's backward does NOT touch G's graph.
+                d_loss_h = gan_loss_fn.discriminator_loss(y_hat.detach(), clean_hop)
+                (d_loss_h / num_hops).backward()
+                total_d_loss += d_loss_h.item()
+
+                if train_generator:
+                    # ── Generator adversarial + feature-matching losses ──────
+                    # y_hat is NOT detached: gradients flow back into z_pred_last.
+                    g_adv, g_feat = gan_loss_fn.generator_loss(y_hat, clean_hop)
+                    hop_loss = hop_loss + lambda_gan * g_adv + lambda_feat * g_feat
 
         # ── Per-hop backward — frees this hop's graph immediately ──────────
         # Accumulating all hops into one tensor before backward would keep
@@ -281,8 +307,12 @@ def sliding_window_train_step(
         # Calling backward here keeps peak memory = 1 hop's graph at a time.
         # Gradients accumulate in .grad buffers across hops; optimizer.zero_grad()
         # must be called BEFORE this function (done in the outer training loop).
-        (hop_loss / num_hops).backward()
-        total_loss_val += hop_loss.item()
+        if train_generator:
+            (hop_loss / num_hops).backward()
+            total_loss_val += hop_loss.item()
+        else:
+            # D warm-up: log MSE for tracking but do not update G
+            total_loss_val += criterion(z_pred_last, z_target_h).item()
 
         # ── Update attractor with EMA (detach = no BPTT) ──────────────────
         # α=0.7 matches the inference engine's attractor_ema, eliminating the
@@ -290,9 +320,9 @@ def sliding_window_train_step(
         # but inference used smoothed updates (α=0.7).
         past_z = 0.7 * past_z + 0.3 * z_pred_h[:, :, -hop_dac:].detach()
 
-    # Return the per-hop-normalized loss as a plain float for logging.
-    # Backward has already been done; the outer loop should NOT call .backward() again.
-    return total_loss_val / num_hops, speaker_steps, pseudo_rms, num_hops
+    # Return per-hop-normalised floats; backward is already done.
+    # Outer loop must NOT call .backward() again.
+    return total_loss_val / num_hops, total_d_loss / num_hops, speaker_steps, pseudo_rms, num_hops
 
 
 # ---------------------------------------------------------------------------
@@ -511,10 +541,12 @@ def train(args):
         train_loader = load_NeuroCodecDataset(
             root=args.root, subset='train',
             batch_size=args.batch_size, num_gpus=1,
+            num_workers=args.num_workers,
         )
         val_loader = load_NeuroCodecDataset(
             root=args.root, subset='val',
             batch_size=args.batch_size, num_gpus=1,
+            num_workers=args.num_workers,
         )
     elif args.dataset == 'kul':
         if load_KUL_NeuroCodecDataset is None:
@@ -526,11 +558,13 @@ def train(args):
             lmdb_path=args.root, subset='train',
             batch_size=args.batch_size, num_gpus=1,
             target_fs=sr, original_fs=original_fs,
+            num_workers=args.num_workers,
         )
         val_loader = load_KUL_NeuroCodecDataset(
             lmdb_path=args.root, subset='val',
             batch_size=args.batch_size, num_gpus=1,
             target_fs=sr, original_fs=original_fs,
+            num_workers=args.num_workers,
         )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
@@ -552,14 +586,18 @@ def train(args):
         hop_dac = model.encode_audio(_dummy)[0].shape[-1]
     print(f"hop_dac = {hop_dac} DAC frames per {args.hop_sec}s hop")
 
-    # ── Optimiser (skip frozen DAC) ─────────────────────────────────────────
-    trainable    = [p for p in model.parameters() if p.requires_grad]
-    optimizer    = optim.AdamW(trainable, lr=args.lr, weight_decay=1e-2)
-    criterion    = nn.MSELoss()
+    # ── Discriminator & GAN Loss ────────────────────────────────────────────
+    discriminator = dac.model.Discriminator(sample_rate=sr).to(device)
+    gan_loss_fn   = GANLoss(discriminator).to(device)
+
+    # ── Optimisers (GAN betas; skip frozen DAC params for G) ───────────────
+    trainable     = [p for p in model.parameters() if p.requires_grad]
+    optimizer_g   = optim.AdamW(trainable,                  lr=args.lr, betas=(0.5, 0.9))
+    optimizer_d   = optim.AdamW(discriminator.parameters(), lr=args.lr, betas=(0.5, 0.9))
+    criterion     = nn.MSELoss()
     mel_criterion = MelSpectrogramLoss(sample_rate=sr)
-    scheduler    = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5
-    )
+    scheduler_g   = optim.lr_scheduler.ReduceLROnPlateau(optimizer_g, mode='min', factor=0.5, patience=5)
+    scheduler_d   = optim.lr_scheduler.ReduceLROnPlateau(optimizer_d, mode='min', factor=0.5, patience=5)
 
     best_val_loss = float('inf')
     start_epoch   = 0
@@ -569,12 +607,16 @@ def train(args):
     latest_model = os.path.join(args.checkpoint_dir, "latest_model.pth")
 
     if os.path.exists(latest_ckpt):
-        # New full-state format — restores optimizer, scheduler, epoch exactly
+        # Full-state checkpoint — restores all optimizers/schedulers exactly.
+        # Backward-compatible: old checkpoints used 'optimizer'/'scheduler' keys.
         print(f"Resuming from full checkpoint: {latest_ckpt}")
         ckpt = torch.load(latest_ckpt, map_location=device)
         model.load_state_dict(ckpt['model'])
-        optimizer.load_state_dict(ckpt['optimizer'])
-        scheduler.load_state_dict(ckpt['scheduler'])
+        optimizer_g.load_state_dict(ckpt.get('optimizer_g', ckpt.get('optimizer', optimizer_g.state_dict())))
+        scheduler_g.load_state_dict(ckpt.get('scheduler_g', ckpt.get('scheduler', scheduler_g.state_dict())))
+        if 'optimizer_d'   in ckpt: optimizer_d.load_state_dict(ckpt['optimizer_d'])
+        if 'scheduler_d'   in ckpt: scheduler_d.load_state_dict(ckpt['scheduler_d'])
+        if 'discriminator' in ckpt: discriminator.load_state_dict(ckpt['discriminator'])
         start_epoch   = ckpt['epoch'] + 1
         best_val_loss = ckpt['best_val_loss']
         print(f"  Resumed at epoch {start_epoch}  |  best val loss so far: {best_val_loss:.4f}")
@@ -599,51 +641,69 @@ def train(args):
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
+        discriminator.train()
         train_loss     = 0.0
-        speaker_steps  = 0   # how many batches used the speaker encoder
-        pseudo_rms_sum = 0.0  # accumulated RMS of pseudo_past
-        log_every      = 50   # print online diagnostics every N batches
-        current_lr     = optimizer.param_groups[0]['lr']
-        pbar           = tqdm(
+        train_d_loss   = 0.0
+        speaker_steps  = 0
+        pseudo_rms_sum = 0.0
+        log_every      = 50
+
+        use_gan         = epoch >= args.gan_start_epoch
+        train_generator = epoch >= args.disc_warmup_epochs
+
+        current_lr = optimizer_g.param_groups[0]['lr']
+        pbar       = tqdm(
             train_loader,
-            desc=f"Epoch {epoch+1}/{args.epochs}  [LR {current_lr:.1e}]",
+            desc=f"Epoch {epoch+1}/{args.epochs}  [LR_G {current_lr:.1e}]",
         )
 
         for batch_idx, (noisy, eeg, clean) in enumerate(pbar):
-            noisy = noisy.to(device)   # (B, 1, T_audio)
-            clean = clean.to(device)   # (B, 1, T_audio)
-            eeg   = eeg.to(device)     # (B, 128, T_eeg)
+            noisy = noisy.to(device)
+            clean = clean.to(device)
+            eeg   = eeg.to(device)
 
-            # ── Ground-truth DAC latents (encode full segment once) ───────
             with torch.no_grad():
                 z_target_full, _ = model.encode_audio(clean)
 
-            # ── Full sliding-window training (exactly mirrors inference) ──
-            # Slides a 2s window through the segment in 0.5s hops.
-            # Hop 0: cold start two-pass; Hop 1+: real model output as attractor.
-            # Loss only on the last hop_dac frames of each prediction.
-            # zero_grad is called HERE (before the step) so that per-hop
-            # backward calls inside the function accumulate into clean .grad buffers.
-            optimizer.zero_grad()
-            loss_val, hop_spk, hop_rms, n_hops = sliding_window_train_step(
+            # zero_grad before the step so per-hop backward() calls accumulate
+            # into clean .grad buffers across hops.
+            optimizer_g.zero_grad()
+            if use_gan:
+                optimizer_d.zero_grad()
+
+            loss_val, d_loss_val, hop_spk, hop_rms, n_hops = sliding_window_train_step(
                 model, noisy, eeg, clean, z_target_full,
                 window_samples, eeg_window, hop_samples, eeg_hop, hop_dac,
                 criterion, mel_criterion, device,
                 lambda_latent=args.lambda_latent,
                 lambda_mel=args.lambda_mel,
+                gan_loss_fn=gan_loss_fn,
+                lambda_gan=args.lambda_gan,
+                lambda_feat=args.lambda_feat,
+                use_gan=use_gan,
+                train_generator=train_generator,
             )
-            # backward is already done inside sliding_window_train_step (per hop);
-            # loss_val is a plain float — the per-hop-normalised training loss.
-            torch.nn.utils.clip_grad_norm_(trainable, max_norm=5.0)
-            optimizer.step()
 
-            train_loss     += loss_val
+            if train_generator:
+                torch.nn.utils.clip_grad_norm_(trainable, max_norm=5.0)
+                optimizer_g.step()
+
+            if use_gan:
+                torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=5.0)
+                optimizer_d.step()
+
+            train_loss   += loss_val
+            train_d_loss += d_loss_val
             speaker_steps  += hop_spk
             pseudo_rms_sum += hop_rms
 
-            pbar.set_postfix({"loss": f"{loss_val:.4f}", "hops": n_hops})
+            postfix = {"loss": f"{loss_val:.4f}", "hops": n_hops}
+            if not train_generator:
+                postfix["mode"] = "D_WARMUP"
+            if use_gan:
+                postfix["d_loss"] = f"{d_loss_val:.4f}"
+            pbar.set_postfix(postfix)
 
-            # ── Online diagnostics every log_every steps ──────────────────
             if (batch_idx + 1) % log_every == 0:
                 frac    = speaker_steps / (log_every * n_hops) * 100
                 avg_rms = pseudo_rms_sum / log_every
@@ -666,34 +726,36 @@ def train(args):
             lambda_latent=args.lambda_latent,
             lambda_mel=args.lambda_mel,
         )
-        scheduler.step(val_loss)
+        scheduler_g.step(val_loss)
+        scheduler_d.step(val_loss)
 
-        avg_train  = train_loss / max(len(train_loader), 1)
-        spk_gain   = val_sisdr - val_sisdr_eeg   # > 0 means speaker encoder is helping
+        avg_train = train_loss   / max(len(train_loader), 1)
+        avg_d     = train_d_loss / max(len(train_loader), 1)
+        spk_gain  = val_sisdr - val_sisdr_eeg
+        d_info    = f" | D {avg_d:.4f}" if use_gan else ""
         print(
             f"Epoch {epoch+1:3d} | "
-            f"Train {avg_train:.4f} | Val {val_loss:.4f} | "
+            f"Train {avg_train:.4f}{d_info} | Val {val_loss:.4f} | "
             f"Cold {val_cold:.4f} | Steady {val_steady:.4f} | "
             f"SI-SDR {val_sisdr:.2f} dB (EEG-only {val_sisdr_eeg:.2f} dB, gain {spk_gain:+.2f} dB)"
         )
 
         # ── Checkpoints ───────────────────────────────────────────────────
-        # Update best_val_loss FIRST so the checkpoint always stores the
-        # current (not previous-epoch) value — prevents stale reads on resume.
         is_best = val_loss < best_val_loss
         if is_best:
             best_val_loss = val_loss
 
-        # Save full training state so training can be resumed exactly
         torch.save({
             'epoch':         epoch,
             'model':         model.state_dict(),
-            'optimizer':     optimizer.state_dict(),
-            'scheduler':     scheduler.state_dict(),
-            'best_val_loss': best_val_loss,   # always current
+            'discriminator': discriminator.state_dict(),
+            'optimizer_g':   optimizer_g.state_dict(),
+            'optimizer_d':   optimizer_d.state_dict(),
+            'scheduler_g':   scheduler_g.state_dict(),
+            'scheduler_d':   scheduler_d.state_dict(),
+            'best_val_loss': best_val_loss,
         }, os.path.join(args.checkpoint_dir, "latest_checkpoint.pth"))
 
-        # Also save inference-ready model-only weights
         torch.save(model.state_dict(),
                    os.path.join(args.checkpoint_dir, "latest_model.pth"))
 
@@ -716,6 +778,8 @@ if __name__ == "__main__":
     parser.add_argument("--eeg_channels",   type=int,   default=128,
                         help="EEG input channels (auto-set to 64 for KUL if left at default 128)")
     parser.add_argument("--batch_size",     type=int,   default=64)
+    parser.add_argument("--num_workers",    type=int,   default=4,
+                        help="DataLoader worker processes (default 4)")
     parser.add_argument("--lr",             type=float, default=5e-4)
     parser.add_argument("--epochs",         type=int,   default=15)
     parser.add_argument("--start_epoch",    type=int,   default=0,
@@ -740,6 +804,16 @@ if __name__ == "__main__":
                         help="Optional path to offline NeuroCodec checkpoint for warm-start")
     parser.add_argument("--debug",          action="store_true",
                         help="Run a fast debug pass (few batches per epoch)")
+
+    # ── GAN hyperparameters ────────────────────────────────────────────────
+    parser.add_argument("--lambda_gan",        type=float, default=0.5,
+                        help="Weight for GAN adversarial loss (default 0.5)")
+    parser.add_argument("--lambda_feat",       type=float, default=1.0,
+                        help="Weight for GAN feature-matching loss (default 1.0)")
+    parser.add_argument("--gan_start_epoch",   type=int,   default=0,
+                        help="Epoch at which GAN training activates (default 0 = from the start)")
+    parser.add_argument("--disc_warmup_epochs",type=int,   default=0,
+                        help="Epochs to train discriminator only before enabling generator GAN loss (default 0)")
 
     args = parser.parse_args()
     train(args)

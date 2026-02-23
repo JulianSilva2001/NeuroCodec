@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchaudio
 
 class MelSpectrogramLoss(nn.Module):
@@ -128,3 +129,53 @@ class MelSpectrogramLoss(nn.Module):
             loss += self.loss_fn(pred_log, target_log)
             
         return loss / len(self.transforms)
+
+
+class GANLoss(nn.Module):
+    """
+    Computes a discriminator loss, given a discriminator on
+    generated waveforms/spectrograms compared to ground truth
+    waveforms/spectrograms. Computes the loss for both the
+    discriminator and the generator in separate functions.
+    Adapted from Descript Audio Codec.
+    """
+
+    def __init__(self, discriminator):
+        super().__init__()
+        self.discriminator = discriminator
+
+    def forward(self, fake, real):
+        # inputs are (B, 1, T) or (B, T)
+        # DAC discriminator expects (B, 1, T) usually
+        if fake.dim() == 2:
+            fake = fake.unsqueeze(1)
+        if real.dim() == 2:
+            real = real.unsqueeze(1)
+
+        d_fake = self.discriminator(fake)
+        d_real = self.discriminator(real)
+        return d_fake, d_real
+
+    def discriminator_loss(self, fake, real):
+        d_fake, d_real = self.forward(fake.clone().detach(), real)
+
+        loss_d = 0
+        for x_fake, x_real in zip(d_fake, d_real):
+            # LSGAN: Real -> 1, Fake -> 0
+            loss_d += torch.mean(x_fake[-1] ** 2)
+            loss_d += torch.mean((1 - x_real[-1]) ** 2)
+        return loss_d
+
+    def generator_loss(self, fake, real):
+        d_fake, d_real = self.forward(fake, real)
+
+        loss_g = 0
+        for x_fake in d_fake:
+            # LSGAN: Fake -> 1
+            loss_g += torch.mean((1 - x_fake[-1]) ** 2)
+
+        loss_feature = 0
+        for i in range(len(d_fake)):
+            for j in range(len(d_fake[i]) - 1):
+                loss_feature += F.l1_loss(d_fake[i][j], d_real[i][j].detach())
+        return loss_g, loss_feature
