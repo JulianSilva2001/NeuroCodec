@@ -120,18 +120,22 @@ def train(args):
         activation=args.activation
     ).to(device)
     
-    if not args.debug:
-        wandb.watch(model, log="all", log_freq=100)
+    # wandb.watch removed — logging all param histograms every 100 steps
+    # was causing multi-minute stalls around batch 100+
     
     # 3.1 Load Checkpoint if Exists (Resume Training)
     latest_checkpoint = os.path.join(args.checkpoint_dir, "latest_model.pth")
     if os.path.exists(latest_checkpoint):
         print(f"Resuming from checkpoint: {latest_checkpoint}")
         try:
-             # Use weights_only=False due to warnings but consider safer alternative if needed
              checkpoint = torch.load(latest_checkpoint, map_location=device)
-             model.load_state_dict(checkpoint)
-             print("Checkpoint loaded successfully.")
+             # Support both new dict format and legacy plain state_dict
+             if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                 model.load_state_dict(checkpoint['model_state_dict'])
+                 print("Model checkpoint loaded successfully.")
+             else:
+                 model.load_state_dict(checkpoint)
+                 print("Model checkpoint loaded successfully (legacy format).")
         except Exception as e:
              print(f"Failed to load checkpoint: {e}. Starting from scratch.")
     else:
@@ -153,6 +157,16 @@ def train(args):
     # GAN Setup
     discriminator = dac.model.Discriminator(sample_rate=16000).to(device)
     gan_loss_fn = GANLoss(discriminator).to(device)
+    
+    # Load discriminator checkpoint if exists
+    if os.path.exists(latest_checkpoint):
+        try:
+            checkpoint = torch.load(latest_checkpoint, map_location=device)
+            if isinstance(checkpoint, dict) and 'discriminator_state_dict' in checkpoint:
+                discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
+                print("Discriminator checkpoint loaded successfully.")
+        except Exception as e:
+            print(f"Failed to load discriminator checkpoint: {e}. Starting discriminator from scratch.")
     
     # Optimizers
     # Generator Optimizer (NeuroCodec)
@@ -176,6 +190,11 @@ def train(args):
         total_loss = 0
         total_g_loss = 0
         total_d_loss = 0
+        total_recon = 0
+        total_mel = 0
+        total_adv = 0
+        total_feat = 0
+        num_batches = 0
         
         # Determine when to start GAN training
         use_gan = epoch >= args.gan_start_epoch
@@ -267,6 +286,11 @@ def train(args):
                 
                 total_loss += recon_loss.item()
                 log_recon_loss = recon_loss.item()
+                total_recon += loss_dict['loss_recon']
+                total_mel += loss_dict.get('loss_mel', 0.0)
+                if use_gan:
+                    total_adv += loss_dict['loss_adv']
+                    total_feat += loss_dict['loss_feat']
             else:
                 # Generator Frozen: Calculate loss for logging but don't backward
                 with torch.no_grad():
@@ -294,90 +318,75 @@ def train(args):
                 postfix['g_feat'] = f"{loss_dict['loss_feat']:.4f}"
                 
             pbar.set_postfix(postfix)
-            
-            if not args.debug:
-                log_dict = {
-                    "train_loss": recon_loss.item(),
-                    "train_loss_recon": loss_dict['loss_recon'],
-                    "train_loss_env": loss_dict.get('loss_env', 0.0), # Use get
-                    "train_pcc": loss_dict.get('pcc', 0.0), # Use get
-                    "lr_g": current_lr_g,
-                    "lr_d": current_lr_d
-                }
-                if 'loss_mel' in loss_dict:
-                    log_dict['train_loss_mel'] = loss_dict['loss_mel']
-                    log_dict['lambda_mel'] = args.lambda_mel
-                
-                if use_gan:
-                    log_dict['train_loss_adv'] = loss_dict['loss_adv']
-                    log_dict['train_loss_feat'] = loss_dict['loss_feat']
-                    log_dict['train_loss_d'] = d_loss.item()
-                    
-                wandb.log(log_dict)
+            num_batches += 1
             
             # Optional: Overfit check (break early)
             if args.debug and batch_idx > 5:
                 break
                 
         
+        # --- Epoch-level WandB logging ---
+        n = max(num_batches, 1)
+        if not args.debug:
+            epoch_log = {
+                "epoch": epoch + 1,
+                "train_loss": total_loss / n,
+                "train_loss_recon": total_recon / n,
+                "train_loss_mel": total_mel / n,
+                "lr_g": current_lr_g,
+                "lr_d": current_lr_d,
+            }
+            if use_gan:
+                epoch_log["train_loss_adv"] = total_adv / n
+                epoch_log["train_loss_feat"] = total_feat / n
+                epoch_log["train_loss_d"] = total_d_loss / n
+        
         # Validation
         if (epoch + 1) % args.val_interval == 0:
-            val_loss, val_sisdr, val_estoi = validate(model, train_loader, criterion, device, args)
+            val_loss, val_sisdr = validate(model, val_loader, criterion, device, args)
             
             # Step Schedulers
             scheduler_g.step(val_loss)
             scheduler_d.step(val_loss)
             
-            print(f"Epoch {epoch+1} | Train Loss: {total_loss/len(train_loader):.4f} | Val Loss: {val_loss:.4f} | Val SI-SDR: {val_sisdr:.2f} dB | Val ESTOI: {val_estoi:.4f}")
+            print(f"Epoch {epoch+1} | Train Loss: {total_loss/n:.4f} | Val Loss: {val_loss:.4f} | Val SI-SDR: {val_sisdr:.2f} dB")
             
             if not args.debug:
-                wandb.log({
-                    "val_loss": val_loss,
-                    "val_sisdr": val_sisdr,
-                    "val_estoi": val_estoi,
-                    "epoch": epoch + 1
-                })
+                epoch_log["val_loss"] = val_loss
+                epoch_log["val_sisdr"] = val_sisdr
             
             # Save Checkpoint (Best)
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                torch.save(model.state_dict(), os.path.join(args.checkpoint_dir, "best_model.pth"))
-                print("Saved Best Model.")
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'discriminator_state_dict': discriminator.state_dict(),
+                }, os.path.join(args.checkpoint_dir, "best_model.pth"))
+                print("Saved Best Model (with Discriminator).")
 
         else:
-            print(f"Epoch {epoch+1} | Train Loss: {total_loss/len(train_loader):.4f} | Validation Skipped")
-            if not args.debug:
-                wandb.log({
-                    "epoch": epoch + 1
-                })
+            print(f"Epoch {epoch+1} | Train Loss: {total_loss/n:.4f} | Validation Skipped")
+        
+        if not args.debug:
+            wandb.log(epoch_log)
         
         # Save Latest Checkpoint (Every Epoch)
-        torch.save(model.state_dict(), os.path.join(args.checkpoint_dir, "latest_model.pth"))
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'discriminator_state_dict': discriminator.state_dict(),
+        }, os.path.join(args.checkpoint_dir, "latest_model.pth"))
 
 def validate(model, loader, criterion, device, args):
     model.eval()
     total_loss = 0.0
     sisdr_scores = []
-    estoi_scores = []
     
     # Import for metrics
     from scipy import signal
-    try:
-        from pystoi import stoi
-    except ImportError:
-        stoi = None
-    estoi_scores = []
-    
-    # Import for metrics
-    from scipy import signal
-    try:
-        from pystoi import stoi
-    except ImportError:
-        stoi = None
     
     with torch.no_grad():
-        for batch_idx, (noisy, eeg, clean) in enumerate(loader):
-            # ... (Existing Loading & Forward) ...
+        pbar = tqdm(loader, desc="Validating")
+        for batch_idx, (noisy, eeg, clean) in enumerate(pbar):
             noisy = noisy.to(device)
             clean = clean.to(device)
             eeg = eeg.to(device)
@@ -433,7 +442,6 @@ def validate(model, loader, criterion, device, args):
                 clean_np = clean_np[np.newaxis, :]
             
             batch_sisdr = []
-            batch_estoi = []
             
             for b in range(pred_np.shape[0]):
                 p = pred_np[b]
@@ -456,41 +464,27 @@ def validate(model, loader, criterion, device, args):
                 # SI-SDR
                 score = sisdr(c, p_aligned)
                 batch_sisdr.append(score)
-                
-                # ESTOI
-                if stoi is not None:
-                    # KUL: 16000, Cocktail: 44100
-                    if args.dataset == 'kul': fs = 16000
-                    else: fs = 44100
-                    
-                    try:
-                        e_val = stoi(c, p_aligned, fs, extended=True)
-                        batch_estoi.append(e_val)
-                    except Exception:
-                        pass
             
             sisdr_scores.extend(batch_sisdr)
-            estoi_scores.extend(batch_estoi)
 
             if args.debug and batch_idx > 2:
                 break
                 
     mean_loss = total_loss / len(loader)
     mean_sisdr = np.mean(sisdr_scores) if len(sisdr_scores) > 0 else 0.0
-    mean_estoi = np.mean(estoi_scores) if len(estoi_scores) > 0 else 0.0
     
-    return mean_loss, mean_sisdr, mean_estoi
+    return mean_loss, mean_sisdr
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root', type=str, default='/workspace/Dataset/kul_all_subjects.lmdb')
+    parser.add_argument('--root', type=str, default='/workspace/KUL-mix/KUL_eeg/kul_all_subjects.lmdb')
     parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--hidden_dim', type=int, default=256) 
     parser.add_argument('--num_layers', type=int, default=4)
     parser.add_argument('--gpu', type=int, default=0)
-    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/neurocodec/KUL/mamba-GAN')
+    parser.add_argument('--checkpoint_dir', type=str, default='/workspace/NeuroCodec/checkpoints/neurocodec/KUL/mamba-mel-gan-final/')
     parser.add_argument('--debug', action='store_true', help="Run fast debug mode")
     parser.add_argument('--dataset', type=str, default='kul', choices=['cocktail', 'kul'], help='Dataset to use')
     parser.add_argument('--eeg_channels', type=int, default=64, help='Number of EEG channels (128 for Cocktail, 64 for KUL)')
@@ -505,10 +499,10 @@ if __name__ == "__main__":
     parser.add_argument('--mel_start_epoch', type=int, default=0, help="Epoch to start applying Mel Loss")
     parser.add_argument('--val_batches', type=int, default=0, help="Limit number of validation batches (0 = full)")
     
-    parser.add_argument('--lambda_gan', type=float, default=1.0, help="Weight for GAN Adversarial Loss")
-    parser.add_argument('--lambda_feat', type=float, default=2.0, help="Weight for GAN Feature Matching Loss")
+    parser.add_argument('--lambda_gan', type=float, default=0.5, help="Weight for GAN Adversarial Loss")
+    parser.add_argument('--lambda_feat', type=float, default=1, help="Weight for GAN Feature Matching Loss")
     parser.add_argument('--gan_start_epoch', type=int, default=0, help="Epoch to start GAN training")
-    parser.add_argument('--disc_warmup_epochs', type=int, default=3, help="Number of epochs to freeze Generator for Discriminator warmup")
+    parser.add_argument('--disc_warmup_epochs', type=int, default=0, help="Number of epochs to freeze Generator for Discriminator warmup")
     
     args = parser.parse_args()
     
@@ -557,16 +551,19 @@ if __name__ == "__main__":
         
         if os.path.exists(checkpoint_path):
             print(f"Loading checkpoint {checkpoint_path}...")
-            # Use weights_only=False to avoid future warnings if safe, or handle pickle security
-            model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                model.load_state_dict(checkpoint)
         else:
             print(f"No checkpoint found at {checkpoint_path}! Running with random weights.")
             
         # Use NeuroCodecLoss for compatibility with validate() function signature
         criterion = NeuroCodecLoss(lambda_recon=1.0, lambda_env=0.0).to(device)
         
-        val_loss, val_sisdr, val_estoi = validate(model, val_loader, criterion, device, args)
-        print(f"Validation Result | Loss: {val_loss:.4f} | SI-SDR: {val_sisdr:.2f} dB | ESTOI: {val_estoi:.4f}")
+        val_loss, val_sisdr = validate(model, val_loader, criterion, device, args)
+        print(f"Validation Result | Loss: {val_loss:.4f} | SI-SDR: {val_sisdr:.2f} dB")
         
     else:
         train(args)

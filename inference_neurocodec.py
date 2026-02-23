@@ -55,7 +55,10 @@ def inference(args):
     ).to(device)
     
     checkpoint = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(checkpoint)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
     model.eval()
     print("Model Loaded.")
     
@@ -217,29 +220,138 @@ def inference(args):
         min_len_in = min(len(clean_filt), len(noisy_filt))
         si_sdr_orig = sisdr(clean_filt[:min_len_in], noisy_filt[:min_len_in])
         
-        # ESTOI
+        # STOI & ESTOI
+        stoi_val = -1
         estoi_val = -1
         try:
-            from pystoi import stoi
-            # Use filtered signals for ESTOI as well? Yes, user requested 4kHz limit.
-            estoi_val = stoi(clean_aligned_pred_filt, pred_aligned_filt, target_fs, extended=True)
+            from pystoi import stoi as pystoi_stoi
+            stoi_val = pystoi_stoi(clean_aligned_pred_filt, pred_aligned_filt, target_fs, extended=False)
+            estoi_val = pystoi_stoi(clean_aligned_pred_filt, pred_aligned_filt, target_fs, extended=True)
         except ImportError:
-            pass
+            print("  [Warning] pystoi not installed, skipping STOI/ESTOI")
         except Exception as e:
-            print(f"ESTOI Error: {e}")
+            print(f"  STOI/ESTOI Error: {e}")
         
-        # Calculate Output Metrics (Filtered)
+        # PESQ
+        pesq_wb = -1
+        pesq_nb = -1
+        try:
+            from pesq import pesq as pesq_fn
+            # PESQ requires 16kHz (wideband) or 8kHz (narrowband)
+            if target_fs == 16000:
+                pesq_wb = pesq_fn(target_fs, clean_aligned_pred_filt, pred_aligned_filt, 'wb')
+                pesq_nb = pesq_fn(target_fs, clean_aligned_pred_filt, pred_aligned_filt, 'nb')
+            elif target_fs > 16000:
+                # Resample to 16kHz for PESQ
+                resample_fs = 16000
+                from scipy.signal import resample_poly
+                from math import gcd
+                g = gcd(target_fs, resample_fs)
+                up, down = resample_fs // g, target_fs // g
+                clean_16k = resample_poly(clean_aligned_pred_filt, up, down)
+                pred_16k = resample_poly(pred_aligned_filt, up, down)
+                pesq_wb = pesq_fn(resample_fs, clean_16k, pred_16k, 'wb')
+                pesq_nb = pesq_fn(resample_fs, clean_16k, pred_16k, 'nb')
+            else:
+                # 8kHz narrowband only
+                pesq_nb = pesq_fn(target_fs, clean_aligned_pred_filt, pred_aligned_filt, 'nb')
+        except ImportError:
+            print("  [Warning] pesq not installed, skipping PESQ (pip install pesq)")
+        except Exception as e:
+            print(f"  PESQ Error: {e}")
+        
+        # Calculate Output Metrics (Filtered) - Wideband
         si_sdr_pred = sisdr(clean_aligned_pred_filt, pred_aligned_filt)
         si_sdr_oracle = sisdr(clean_aligned_oracle_filt, oracle_aligned_filt)
 
-        print(f"Metrics Sample {i} (0-4kHz Band-limited):")
+        # --- Conditional Metrics (cSISDR): using DAC oracle as reference ---
+        # Align prediction to oracle reconstruction (not raw clean)
+        oracle_for_cond, pred_for_cond, lag_cond = align_signals(clean_recon_np, pred_np)
+        oracle_for_cond_filt = lowpass_filter(oracle_for_cond, fs=target_fs)
+        pred_for_cond_filt = lowpass_filter(pred_for_cond, fs=target_fs)
+        
+        # cSISDR: how close is the output to the best DAC can do?
+        csisdr_pred = sisdr(oracle_for_cond_filt, pred_for_cond_filt)
+        
+        # cSTOI / cESTOI
+        cstoi_val = -1
+        cestoi_val = -1
+        try:
+            from pystoi import stoi as pystoi_stoi
+            cstoi_val = pystoi_stoi(oracle_for_cond_filt, pred_for_cond_filt, target_fs, extended=False)
+            cestoi_val = pystoi_stoi(oracle_for_cond_filt, pred_for_cond_filt, target_fs, extended=True)
+        except ImportError:
+            pass
+        except Exception as e:
+            print(f"  cSTOI/cESTOI Error: {e}")
+        
+        # cPESQ
+        cpesq_wb = -1
+        try:
+            from pesq import pesq as pesq_fn
+            if target_fs == 16000:
+                cpesq_wb = pesq_fn(target_fs, oracle_for_cond_filt, pred_for_cond_filt, 'wb')
+            elif target_fs > 16000:
+                from scipy.signal import resample_poly as resample_poly2
+                from math import gcd as gcd2
+                g2 = gcd2(target_fs, 16000)
+                oracle_16k = resample_poly2(oracle_for_cond_filt, 16000 // g2, target_fs // g2)
+                pred_16k = resample_poly2(pred_for_cond_filt, 16000 // g2, target_fs // g2)
+                cpesq_wb = pesq_fn(16000, oracle_16k, pred_16k, 'wb')
+        except ImportError:
+            pass
+        except Exception as e:
+            print(f"  cPESQ Error: {e}")
+
+        # --- Narrowband Metrics (resample to 8kHz, Nyquist = 4kHz) ---
+        from scipy.signal import resample_poly
+        from math import gcd
+        
+        nb_fs = 8000
+        g = gcd(target_fs, nb_fs)
+        up_nb, down_nb = nb_fs // g, target_fs // g
+        
+        clean_nb = resample_poly(clean_aligned_pred_filt, up_nb, down_nb)
+        pred_nb = resample_poly(pred_aligned_filt, up_nb, down_nb)
+        
+        # Narrowband input SI-SDR (resample mixture & clean to 8kHz)
+        noisy_nb = resample_poly(noisy_filt, up_nb, down_nb)
+        clean_nb_full = resample_poly(clean_filt, up_nb, down_nb)
+        min_len_nb = min(len(noisy_nb), len(clean_nb_full))
+        si_sdr_orig_nb = sisdr(clean_nb_full[:min_len_nb], noisy_nb[:min_len_nb])
+        
+        # Narrowband SI-SDR
+        si_sdr_pred_nb = sisdr(clean_nb, pred_nb)
+        
+        # Narrowband STOI & ESTOI
+        stoi_nb = -1
+        estoi_nb = -1
+        try:
+            from pystoi import stoi as pystoi_stoi
+            stoi_nb = pystoi_stoi(clean_nb, pred_nb, nb_fs, extended=False)
+            estoi_nb = pystoi_stoi(clean_nb, pred_nb, nb_fs, extended=True)
+        except ImportError:
+            pass
+        except Exception as e:
+            print(f"  NB STOI/ESTOI Error: {e}")
+
+        print(f"Metrics Sample {i}:")
         print(f"  Inference Time:   {inference_time:.4f}s")
         print(f"  Input Duration:   {noisy.shape[-1] / target_fs:.2f}s ({noisy.shape[-1]} samples)")
+        print(f"  --- Standard (ref: raw clean, 0-4kHz) ---")
         print(f"  Input SI-SDR:     {si_sdr_orig:.2f} dB")
         print(f"  Oracle SI-SDR:    {si_sdr_oracle:.2f} dB (Lag: {lag_oracle})")
         print(f"  Output SI-SDR:    {si_sdr_pred:.2f} dB (Lag: {lag_pred})")
+        print(f"  Output STOI:      {stoi_val:.4f}")
         print(f"  Output ESTOI:     {estoi_val:.4f}")
+        print(f"  Output PESQ (wb): {pesq_wb:.3f}")
+        print(f"  Output PESQ (nb): {pesq_nb:.3f}")
         print(f"  Improvement:      {si_sdr_pred - si_sdr_orig:.2f} dB")
+        print(f"  --- Conditional (ref: DAC oracle) ---")
+        print(f"  cSI-SDR:          {csisdr_pred:.2f} dB (Lag: {lag_cond})")
+        print(f"  cSTOI:            {cstoi_val:.4f}")
+        print(f"  cESTOI:           {cestoi_val:.4f}")
+        print(f"  cPESQ (wb):       {cpesq_wb:.3f}")
         
         
         # 6.5 Calculate Filtered Interferer
@@ -281,8 +393,8 @@ def inference(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root', type=str, default='/workspace/Dataset/kul_all_subjects.lmdb')
-    parser.add_argument('--checkpoint', type=str, default='checkpoints/neurocodec/KUL/mamba-GAN/latest_model.pth')
+    parser.add_argument('--root', type=str, default='/workspace/KUL-mix/KUL_eeg/kul_all_subjects.lmdb')
+    parser.add_argument('--checkpoint', type=str, default='/workspace/NeuroCodec/checkpoints/neurocodec/KUL/mamba-mel-gan-final/latest_model.pth')
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--subset', type=str, default='val', help="Dataset subset to use (train, val, test)")
     parser.add_argument('--num_samples', type=int, default=10, help="Number of samples to process")
