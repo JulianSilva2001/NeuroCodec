@@ -164,7 +164,9 @@ class GANLoss(nn.Module):
             # LSGAN: Real -> 1, Fake -> 0
             loss_d += torch.mean(x_fake[-1] ** 2)
             loss_d += torch.mean((1 - x_real[-1]) ** 2)
-        return loss_d
+        # Normalize by number of sub-discriminators so loss scale is
+        # independent of how many sub-discs the DAC Discriminator contains.
+        return loss_d / max(len(d_fake), 1)
 
     def generator_loss(self, fake, real):
         d_fake, d_real = self.forward(fake, real)
@@ -173,9 +175,14 @@ class GANLoss(nn.Module):
         for x_fake in d_fake:
             # LSGAN: Fake -> 1
             loss_g += torch.mean((1 - x_fake[-1]) ** 2)
+        loss_g = loss_g / max(len(d_fake), 1)
 
         loss_feature = 0
+        n_pairs = 0
         for i in range(len(d_fake)):
             for j in range(len(d_fake[i]) - 1):
                 loss_feature += F.l1_loss(d_fake[i][j], d_real[i][j].detach())
+                n_pairs += 1
+        if n_pairs > 0:
+            loss_feature = loss_feature / n_pairs
         return loss_g, loss_feature

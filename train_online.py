@@ -541,12 +541,10 @@ def train(args):
         train_loader = load_NeuroCodecDataset(
             root=args.root, subset='train',
             batch_size=args.batch_size, num_gpus=1,
-            num_workers=args.num_workers,
         )
         val_loader = load_NeuroCodecDataset(
             root=args.root, subset='val',
             batch_size=args.batch_size, num_gpus=1,
-            num_workers=args.num_workers,
         )
     elif args.dataset == 'kul':
         if load_KUL_NeuroCodecDataset is None:
@@ -558,13 +556,11 @@ def train(args):
             lmdb_path=args.root, subset='train',
             batch_size=args.batch_size, num_gpus=1,
             target_fs=sr, original_fs=original_fs,
-            num_workers=args.num_workers,
         )
         val_loader = load_KUL_NeuroCodecDataset(
             lmdb_path=args.root, subset='val',
             batch_size=args.batch_size, num_gpus=1,
             target_fs=sr, original_fs=original_fs,
-            num_workers=args.num_workers,
         )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
@@ -778,8 +774,7 @@ if __name__ == "__main__":
     parser.add_argument("--eeg_channels",   type=int,   default=128,
                         help="EEG input channels (auto-set to 64 for KUL if left at default 128)")
     parser.add_argument("--batch_size",     type=int,   default=64)
-    parser.add_argument("--num_workers",    type=int,   default=4,
-                        help="DataLoader worker processes (default 4)")
+
     parser.add_argument("--lr",             type=float, default=5e-4)
     parser.add_argument("--epochs",         type=int,   default=15)
     parser.add_argument("--start_epoch",    type=int,   default=0,
