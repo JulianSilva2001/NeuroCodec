@@ -12,7 +12,6 @@ from utility.utils import normalize_A, generate_cheby_adj
 from utility.utils import ChannelwiseLayerNorm, ResBlock, Conv1D
 
 
-
 # Import existing modules
 # We redefine EEGEncoder to avoid hardcoded shapes in M3ANET.py
 from models.groupmamba import GroupMamba 
@@ -25,7 +24,7 @@ class Chebynet(nn.Module):
         for i in range(k_adj):
             self.gc.append(GraphConvolution(in_channel, in_channel))
 
-    def forward(self, x, L):
+    def forward(self, x ,L):
         adj = generate_cheby_adj(L, self.K)
         for i in range(len(self.gc)):
             if i == 0:
@@ -35,47 +34,9 @@ class Chebynet(nn.Module):
         result = F.relu(result)
         return result
 
-class MultiScaleProjection(nn.Module):
-    """
-    Replaces the standard Conv1D projection with an Inception-style multi-scale block.
-    Captures different temporal receptive fields simultaneously.
-    """
-    def __init__(self, in_channels, out_channels, stride=1):
-        super().__init__()
-        # Divide the output channels roughly equally across 3 branches
-        out1 = out_channels // 3
-        out2 = out_channels // 3
-        out3 = out_channels - out1 - out2
-        
-        # Branch 1: Small temporal window (High frequency patterns)
-        self.branch1 = nn.Conv1d(in_channels, out1, kernel_size=3, stride=stride, padding=1, bias=False)
-        
-        # Branch 2: Medium temporal window
-        self.branch2 = nn.Conv1d(in_channels, out2, kernel_size=7, stride=stride, padding=3, bias=False)
-        
-        # Branch 3: Larger temporal window (Low frequency/slower oscillations)
-        self.branch3 = nn.Conv1d(in_channels, out3, kernel_size=11, stride=stride, padding=5, bias=False)
-        
-        self.bn = nn.BatchNorm1d(out_channels)
-        self.activation = nn.PReLU()
-
-    def forward(self, x):
-        # x: (B, in_channels, T)
-        x1 = self.branch1(x)
-        x2 = self.branch2(x)
-        x3 = self.branch3(x)
-        
-        # Concatenate along the channel dimension
-        out = torch.cat([x1, x2, x3], dim=1)
-        
-        # Normalize and activate
-        out = self.bn(out)
-        return self.activation(out)
-
-
 class FlexibleEEGEncoder(nn.Module):
-    def __init__(self, num_electrodes=128, k_adj=3, enc_channel=128, feature_channel=64, 
-                 norm='ln', K=160, stride=1, dropout=0.3): 
+    def __init__(self, num_electrodes=128, k_adj=3, enc_channel=128, feature_channel=64, kernel_size=8,
+                 norm='ln', K=160, kernel=3, stride=1, dropout=0.3): # Changed stride 4 -> 1
         super().__init__()
         self.stride = stride
         self.K = k_adj
@@ -83,28 +44,28 @@ class FlexibleEEGEncoder(nn.Module):
         # BN over Electrodes (Channels)
         self.BN1 = nn.BatchNorm1d(num_electrodes)
         
-        # Spatial Graph Convolution
         self.layer1 = Chebynet(num_electrodes, k_adj)
-        
-        # Multi-Scale Temporal Projection (Replaces the single Conv1d)
-        self.projection = MultiScaleProjection(in_channels=num_electrodes, out_channels=feature_channel, stride=self.stride)
+        # Stride=1 to preserve time resolution
+        self.projection = nn.Conv1d(num_electrodes, feature_channel, kernel_size, bias=False, stride=self.stride)
         
         # Learnable Adjacency Matrix
-        self.A = nn.Parameter(torch.FloatTensor(num_electrodes, num_electrodes))
+        self.A = nn.Parameter(torch.FloatTensor(num_electrodes , num_electrodes))
         nn.init.xavier_normal_(self.A)
         
+        # Let's use simple Conv1D blocks to keep it clean and adaptable
         self.dropout = nn.Dropout(dropout)
-        
-        # Further feature extraction
         self.eeg_encoder = nn.Sequential(
             ChannelwiseLayerNorm(feature_channel),
             Conv1D(feature_channel, feature_channel, 1),
+            # ResBlock(feature_channel, feature_channel), # Removed due to pooling
             Conv1D(feature_channel, feature_channel, 3, padding=1),
             nn.PReLU(),
             self.dropout,
+            # ResBlock(feature_channel, enc_channel),
             Conv1D(feature_channel, enc_channel, 3, padding=1),
             nn.PReLU(),
             self.dropout,
+            # ResBlock(enc_channel, enc_channel),
             Conv1D(enc_channel, enc_channel, 3, padding=1),
             nn.PReLU(),
             self.dropout,
@@ -115,25 +76,30 @@ class FlexibleEEGEncoder(nn.Module):
         # spike: (B, 128, T)
         
         # Normalize Electrodes
+        # BN expects (B, C, L) -> (B, 128, T)
         spike = self.BN1(spike)
         
-        # Ensure Adjacency matrix is on the correct device
+        # Chebynet (GCN)
+        # Expects (B, 128, T) ?
+        # normalize_A expects A on same device
         if self.A.device != spike.device:
             self.A = self.A.to(spike.device)
             
         L = normalize_A(self.A)
         
-        # 1. Spatial Processing via GCN
+        # Chebynet implementation in M3ANET seems to take (x, adj)
+        # GraphConvolution usually expects (B, N, T) or (B, N, C)?
+        # M3ANET GraphConvolution: x is (B, N, T)?
+        # Let's assume it works on (B, N, T) and propagates info across N.
         output = self.layer1(spike, L)
         
-        # 2. Multi-Scale Temporal Processing
+        # Projection (Conv1d)
         # (B, 128, T) -> (B, feature_channel, T')
         output = self.projection(output)    
-        
-        # 3. Further Feature Encoding
         output = self.eeg_encoder(output)   
 
         return output
+
 
 
 class Snake(nn.Module):
@@ -319,6 +285,10 @@ class NeuroCodec(nn.Module):
         # 6. Output Head (Regression to Z)
         # Hidden -> 1024 (DAC Latent Dim)
         self.output_proj = nn.Linear(hidden_dim, 1024)
+        
+        # 7. Envelope Projection Head (New for Step 13)
+        # EEG Features (64) -> Envelope (1)
+        self.envelope_proj = nn.Conv1d(64, 1, kernel_size=1)
 
     def forward(self, mixture, eeg):
         """
@@ -333,7 +303,11 @@ class NeuroCodec(nn.Module):
         # 2. Encode EEG
         eeg_feat = self.eeg_encoder(eeg)
         
-        # 3. Preparation for Core
+        # 3. Envelope Prediction (Auxiliary Task)
+        # eeg_feat: (B, 64, T_eeg) -> (B, 1, T_eeg) -> (B, T_eeg)
+        envelope_pred = self.envelope_proj(eeg_feat).squeeze(1)
+        
+        # 4. Preparation for Core
         # z_mix: (B, 1024, T)
         # Transpose to (B, T, 1024) for Linear
         x_audio = z_mix.transpose(1, 2)
@@ -369,7 +343,7 @@ class NeuroCodec(nn.Module):
         # Transpose back to (B, 1024, T) for loss/DAC
         z_pred = z_pred.transpose(1, 2)
         
-        return z_pred, codes_mix, z_mix, eeg_feat, last_attn_weights
+        return z_pred, codes_mix, z_mix, eeg_feat, last_attn_weights, envelope_pred
 
 if __name__ == "__main__":
     # Internal Verification

@@ -5,9 +5,10 @@ import numpy as np
 from torch.utils.data.distributed import DistributedSampler
 
 class NeuroCodecDataset(Dataset):
-    def __init__(self, root, mode, subject=None):
+    def __init__(self, root, mode, subject=None, return_subject=False):
         super().__init__()
         self.root = root
+        self.return_subject = return_subject
         # Handle path dynamically based on input root
         if root.endswith('new'):
              self.file_path = root
@@ -23,6 +24,7 @@ class NeuroCodecDataset(Dataset):
             self.noisy_file = os.path.join(self.file_path, 'noisy_train.h5')
             self.clean_file = os.path.join(self.file_path, 'clean_train.h5')
             self.eeg_file = os.path.join(self.file_path, 'eegs_train.h5')
+            self.subject_file = os.path.join(self.file_path, 'subjects_train.h5')
             f = h5py.File(self.noisy_file, 'r')
             d = f['noisy_train=']
             self.length = len(d)
@@ -31,6 +33,7 @@ class NeuroCodecDataset(Dataset):
             self.noisy_file = os.path.join(self.file_path, 'noisy_val.h5')
             self.clean_file = os.path.join(self.file_path, 'clean_val.h5')
             self.eeg_file = os.path.join(self.file_path, 'eegs_val.h5')
+            self.subject_file = os.path.join(self.file_path, 'subjects_val.h5')
             f = h5py.File(self.noisy_file, 'r')
             d = f['noisy_val=']
             self.length = len(d)
@@ -53,6 +56,7 @@ class NeuroCodecDataset(Dataset):
                 self.length = len(d)
                 f.close()
         
+        self.has_subjects = os.path.exists(self.subject_file)
         self.mode = mode
 
     def __len__(self):
@@ -63,6 +67,9 @@ class NeuroCodecDataset(Dataset):
             self.noisy_f = h5py.File(self.noisy_file, 'r')
             self.clean_f = h5py.File(self.clean_file, 'r')
             self.eeg_f = h5py.File(self.eeg_file, 'r')
+        if self.return_subject and self.has_subjects:
+            if not hasattr(self, 'subject_f') or self.subject_f is None:
+                self.subject_f = h5py.File(self.subject_file, 'r')
 
     def __getitem__(self, idx):
         # Handle Test/Subject specific indexing
@@ -102,7 +109,17 @@ class NeuroCodecDataset(Dataset):
         n_d = n_d.astype(np.float32)
         c_d = c_d.astype(np.float32)
         e_d = e_d.astype(np.float32)
-        
+
+        if self.return_subject:
+            if self.has_subjects:
+                subject_key = f'subjects_{self.mode}='
+                subject_data = self.subject_f[subject_key]
+                subject_val = subject_data[true_idx]
+                subject_val = int(subject_val)
+            else:
+                subject_val = -1
+            return torch.from_numpy(n_d), torch.from_numpy(e_d), torch.from_numpy(c_d), subject_val
+
         return torch.from_numpy(n_d), torch.from_numpy(e_d), torch.from_numpy(c_d)
         return torch.from_numpy(n_d).float(), torch.from_numpy(e_d).float(), torch.from_numpy(c_d).float()
     
@@ -113,12 +130,14 @@ class NeuroCodecDataset(Dataset):
             self.clean_f.close()
         if hasattr(self, 'eeg_f') and self.eeg_f is not None:
             self.eeg_f.close()
+        if hasattr(self, 'subject_f') and self.subject_f is not None:
+            self.subject_f.close()
 
-def load_NeuroCodecDataset(root, subset='train', batch_size=4, num_gpus=1, shuffle=None):
+def load_NeuroCodecDataset(root, subset='train', batch_size=4, num_gpus=1, shuffle=None, return_subject=False):
     """
     Loader for Cocktail Party Dataset (H5)
     """
-    dataset = NeuroCodecDataset(root, mode=subset)
+    dataset = NeuroCodecDataset(root, mode=subset, return_subject=return_subject)
     
     sampler = None
     if num_gpus > 1:
@@ -158,7 +177,7 @@ def load_NeuroCodecDataset(root, subset='train', batch_size=4, num_gpus=1, shuff
         dataset,
         batch_size=batch_size,
         shuffle=shuffle, # Use the determined variable
-        num_workers=4,
+        num_workers=12,
         sampler=sampler,
         pin_memory=True
     )
@@ -172,7 +191,7 @@ import pickle
 import torchaudio
 
 class KULNeuroCodecDataset(Dataset):
-    def __init__(self, lmdb_path, indices=None, target_fs=44100, original_fs=8000):
+    def __init__(self, lmdb_path, indices=None, target_fs=44100, original_fs=8000, return_subject=False):
         super().__init__()
         self.lmdb_path = lmdb_path
         self.indices = indices # List of LMDB keys (integers)
@@ -180,6 +199,7 @@ class KULNeuroCodecDataset(Dataset):
         self.txn = None
         self.target_fs = target_fs
         self.original_fs = original_fs
+        self.return_subject = return_subject
         
         # Resampler: original_fs -> target_fs
         if self.original_fs != self.target_fs:
@@ -244,10 +264,20 @@ class KULNeuroCodecDataset(Dataset):
         # similar to what it saw during training ~0.005?
         # Let's verify KUL range. Usually uV. 
         # For now return raw, user can normalize in training if needed.
-        
+
+        if self.return_subject:
+            subject_val = data.get('subject', None)
+            if isinstance(subject_val, (bytes, bytearray)):
+                subject_val = subject_val.decode('utf-8', errors='ignore')
+            if subject_val is None:
+                subject_val = "Unknown"
+            else:
+                subject_val = str(subject_val)
+            return mix_resampled, eeg, clean_resampled, subject_val
+
         return mix_resampled, eeg, clean_resampled
 
-def load_KUL_NeuroCodecDataset(lmdb_path, subset='train', batch_size=4, num_gpus=1, target_fs=44100, original_fs=16000, shuffle=None):
+def load_KUL_NeuroCodecDataset(lmdb_path, subset='train', batch_size=4, num_gpus=1, target_fs=44100, original_fs=16000, shuffle=None, return_subject=False):
     """
     Loader for KUL Dataset (LMDB) with Subject-wise Splitting
     """
@@ -343,7 +373,7 @@ def load_KUL_NeuroCodecDataset(lmdb_path, subset='train', batch_size=4, num_gpus
     
     print(f"Subset '{subset}': {len(target_indices)} samples (Subjects: {train_subj if subset=='train' else (val_subj if subset=='val' else test_subj)})")
     
-    dataset = KULNeuroCodecDataset(lmdb_path, indices=target_indices, target_fs=target_fs, original_fs=original_fs)
+    dataset = KULNeuroCodecDataset(lmdb_path, indices=target_indices, target_fs=target_fs, original_fs=original_fs, return_subject=return_subject)
     
     sampler = None
     if num_gpus > 1:
@@ -357,7 +387,7 @@ def load_KUL_NeuroCodecDataset(lmdb_path, subset='train', batch_size=4, num_gpus
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=4,
+        num_workers=12,
         sampler=sampler,
         pin_memory=True
     )

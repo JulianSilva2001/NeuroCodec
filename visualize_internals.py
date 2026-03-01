@@ -84,18 +84,14 @@ def visualize(args):
         # 3. Forward Pass
         with torch.no_grad():
             output = model(noisy, eeg)
-            if len(output) == 6:
-                z_pred, codes, z_mix, eeg_feat, attn, env_pred = output
-            else:
-                z_pred, codes, z_mix, eeg_feat, attn = output
-                env_pred = torch.zeros(eeg_feat.shape[0], eeg_feat.shape[-1]).to(device) # Dummy
+            z_pred, codes, z_mix, eeg_feat, attn = output
             
         print(f"\nSHAPES CHECK:")
         print(f"  Input EEG:      {eeg.shape}  (Batch, 128, Time)")
         print(f"  Encoded EEG:    {eeg_feat.shape} (Batch, 64,  Time_Latent)")
         print(f"  Attn Weights:   {attn.shape} (Batch, Time_Audio, Time_EEG)")
         print(f"  Z Prediction:   {z_pred.shape} (Batch, 1024, Time_Audio)")
-        print(f"  Env Prediction: {env_pred.shape} (Batch, Time_Latent)")
+        
             
         # 4. Process for Plotting
         # EEG Features: (B, 64, T_eeg) -> (64, T_eeg)
@@ -277,23 +273,6 @@ def visualize(args):
         plt.title(f"Cosine Sim (Mean: {sim.mean():.4f}, Lag: {lag_z})")
         plt.ylim(-1, 1)
         plt.grid(True, alpha=0.3)
-    
-        # F. InfoNCE Similarity Matrix (Time x Time)
-        # F. Envelope Prediction
-        from losses_neurocodec import EnvelopeMatcher
-        env_matcher = EnvelopeMatcher(target_rate=128, audio_rate=44100)
-        
-        # Pred Envelope (B, T_eeg) -> (T_eeg)
-        env_pred_map = env_pred[0].cpu().numpy()
-        
-        # GT Envelope (from clean audio)
-        with torch.no_grad():
-             env_gt = env_matcher.extract_envelope(clean.to(device))
-        env_gt_map = env_gt[0].cpu().numpy()
-        
-        # Align lengths
-        min_len_env = min(len(env_pred_map), len(env_gt_map))
-        
     
         # F. Z-Values (Condensed to Row 6)
         plt.subplot(6, 2, 11)

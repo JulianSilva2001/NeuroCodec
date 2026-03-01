@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import wandb
+
 import numpy as np
 import dac.model # Added this import
 
@@ -56,9 +56,7 @@ def train(args):
     print(f"Backbone: {args.backbone.upper()}")
     print(f"Dataset: {args.dataset.upper()}")
     
-    # Initialize WandB
-    if not args.debug:
-        wandb.init(project="NeuroCodec", config=vars(args))
+
 
     # 2. Dataset
     print("Loading Dataset...")
@@ -117,21 +115,37 @@ def train(args):
         hidden_dim=args.hidden_dim, # e.g. 256
         num_layers=args.num_layers,  # e.g. 4
         backbone=args.backbone,
-        activation=args.activation
+        activation=args.activation,
+        dropout=args.dropout
     ).to(device)
     
-    if not args.debug:
-        wandb.watch(model, log="all", log_freq=100)
+
     
     # 3.1 Load Checkpoint if Exists (Resume Training)
     latest_checkpoint = os.path.join(args.checkpoint_dir, "latest_model.pth")
     if os.path.exists(latest_checkpoint):
         print(f"Resuming from checkpoint: {latest_checkpoint}")
         try:
-             # Use weights_only=False due to warnings but consider safer alternative if needed
-             checkpoint = torch.load(latest_checkpoint, map_location=device)
-             model.load_state_dict(checkpoint)
-             print("Checkpoint loaded successfully.")
+             checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=True)
+             if isinstance(checkpoint, dict):
+                 if "state_dict" in checkpoint:
+                     state_dict = checkpoint["state_dict"]
+                 elif "model_state_dict" in checkpoint:
+                     state_dict = checkpoint["model_state_dict"]
+                 elif "model" in checkpoint:
+                     state_dict = checkpoint["model"]
+                 else:
+                     state_dict = checkpoint
+             else:
+                 state_dict = checkpoint
+             
+             # Allow loading older checkpoints with now-removed keys (e.g., envelope head)
+             incompatible = model.load_state_dict(state_dict, strict=False)
+             if incompatible.missing_keys:
+                 print(f"Warning: Missing keys ({len(incompatible.missing_keys)}).")
+             if incompatible.unexpected_keys:
+                 print(f"Warning: Unexpected keys ({len(incompatible.unexpected_keys)}): {incompatible.unexpected_keys}")
+             print("Checkpoint loaded (strict=False).")
         except Exception as e:
              print(f"Failed to load checkpoint: {e}. Starting from scratch.")
     else:
@@ -140,9 +154,7 @@ def train(args):
     # 4. Optimizer
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-2) 
     
-    # Updated: Transformer Ablation (No Envelope Loss per user request)
-    # lambda_env=0.0 removes PCC loss
-    criterion = NeuroCodecLoss(lambda_recon=1.0, lambda_env=0.0).to(device)
+    criterion = NeuroCodecLoss(lambda_recon=1.0).to(device)
     mel_loss_fn = MelSpectrogramLoss(
         sample_rate=16000,
         window_lengths=[1024, 512, 256, 128],
@@ -201,82 +213,86 @@ def train(args):
                 z_target, _, _, _, _ = model.dac.encode(clean)
             
             # 2. Model Forward
-            z_pred, _, _, _, _, env_pred = model(noisy, eeg)
+            z_pred, _, _, _, _ = model(noisy, eeg)
             
-            # Decode for GAN / Mel Loss (Using Gumbel Softmax or Straight Through in Quantizer inside DAC?)
-            # DAC encode returns z, codes, latents, etc. 
-            # We need differentiable audio for GAN.
-            # model.dac.decode(z_pred) should be differentiable if z_pred is differentiable.
-            # But z_pred usually goes through quantizer.
-            # Let's assume model(noisy, eeg) returns 'z_pred' which is the predicted latent.
-            # We need to pass this through DAC's quantizer (straight-through) and decoder.
-            
-            # DAC Quantizer
-            # The quantizer returns (z_q, codes, latents, bandwidth, commit_loss)
-            z_q, _, _, _, _ = model.dac.quantizer(z_pred, n_quantizers=9) # Use 9 quantizers as in validate
-            
-            # Decode
-            pred_audio = model.dac.decode(z_q)
-            
-            # Align lengths (pred_audio might be slightly longer/shorter due to padding/striding)
-            min_len = min(pred_audio.shape[-1], clean.shape[-1])
-            pred_audio = pred_audio[..., :min_len]
-            clean_aligned = clean[..., :min_len]
-            
-            # --- Discriminator Step ---
-            if use_gan:
-                optimizer_d.zero_grad()
-                d_loss = gan_loss_fn.discriminator_loss(pred_audio.detach(), clean_aligned)
-                d_loss.backward()
-                optimizer_d.step()
-                total_d_loss += d_loss.item()
-            else:
-                d_loss = torch.tensor(0.0)
-
-            # --- Generator Step ---
-            # Update Generator only if not in warmup
-            train_generator = epoch >= args.disc_warmup_epochs
-            
-            optimizer_g.zero_grad()
-            
-            if train_generator:
-                # 1. Reconstruction Losses (MSE, Env, PCC)
-                recon_loss, loss_dict = criterion(z_pred, z_target, env_pred, clean)
-                
-                # 2. Mel Spectrogram Loss
-                if epoch >= args.mel_start_epoch:
-                    mel_loss = mel_loss_fn(pred_audio, clean_aligned)
-                    recon_loss += args.lambda_mel * mel_loss
-                    loss_dict['loss_mel'] = mel_loss.item()
-                else:
-                    loss_dict['loss_mel'] = 0.0
-                
-                # 3. GAN Generator Loss
-                if use_gan:
-                    g_loss_adv, g_loss_feat = gan_loss_fn.generator_loss(pred_audio, clean_aligned)
-                    gan_term = args.lambda_gan * g_loss_adv + args.lambda_feat * g_loss_feat
-                    recon_loss += gan_term
-                    loss_dict['loss_adv'] = g_loss_adv.item()
-                    loss_dict['loss_feat'] = g_loss_feat.item()
-                    total_g_loss += g_loss_adv.item() + g_loss_feat.item() 
-                
+            # --- MSE-only mode: skip decoder entirely ---
+            if args.loss == 'mse':
+                train_generator = True
+                use_gan = False
+                optimizer_g.zero_grad()
+                recon_loss, loss_dict = criterion(z_pred, z_target)
+                loss_dict['loss_mel'] = 0.0
                 recon_loss.backward()
-                # Gradient Clipping (Prevent Explosion) for Generator
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer_g.step()
-                
                 total_loss += recon_loss.item()
                 log_recon_loss = recon_loss.item()
+                d_loss = torch.tensor(0.0)
             else:
-                # Generator Frozen: Calculate loss for logging but don't backward
-                with torch.no_grad():
-                     recon_loss, loss_dict = criterion(z_pred, z_target, env_pred, clean)
-                     log_recon_loss = recon_loss.item()
-                     loss_dict['loss_mel'] = 0.0
-                     if use_gan: # Log what G loss would be
+                # --- Full mode: decode for GAN / Mel Loss ---
+                # DAC Quantizer
+                z_q, _, _, _, _ = model.dac.quantizer(z_pred, n_quantizers=9)
+                
+                # Decode
+                pred_audio = model.dac.decode(z_q)
+                
+                # Align lengths
+                min_len = min(pred_audio.shape[-1], clean.shape[-1])
+                pred_audio = pred_audio[..., :min_len]
+                clean_aligned = clean[..., :min_len]
+                
+                # --- Discriminator Step ---
+                if use_gan:
+                    optimizer_d.zero_grad()
+                    d_loss = gan_loss_fn.discriminator_loss(pred_audio.detach(), clean_aligned)
+                    d_loss.backward()
+                    optimizer_d.step()
+                    total_d_loss += d_loss.item()
+                else:
+                    d_loss = torch.tensor(0.0)
+
+                # --- Generator Step ---
+                train_generator = epoch >= args.disc_warmup_epochs
+                
+                optimizer_g.zero_grad()
+                
+                if train_generator:
+                    # 1. Reconstruction Losses (MSE on latents)
+                    recon_loss, loss_dict = criterion(z_pred, z_target)
+                    
+                    # 2. Mel Spectrogram Loss
+                    if epoch >= args.mel_start_epoch:
+                        mel_loss = mel_loss_fn(pred_audio, clean_aligned)
+                        recon_loss += args.lambda_mel * mel_loss
+                        loss_dict['loss_mel'] = mel_loss.item()
+                    else:
+                        loss_dict['loss_mel'] = 0.0
+                    
+                    # 3. GAN Generator Loss
+                    if use_gan:
                         g_loss_adv, g_loss_feat = gan_loss_fn.generator_loss(pred_audio, clean_aligned)
+                        gan_term = args.lambda_gan * g_loss_adv + args.lambda_feat * g_loss_feat
+                        recon_loss += gan_term
                         loss_dict['loss_adv'] = g_loss_adv.item()
                         loss_dict['loss_feat'] = g_loss_feat.item()
+                        total_g_loss += g_loss_adv.item() + g_loss_feat.item() 
+                    
+                    recon_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer_g.step()
+                    
+                    total_loss += recon_loss.item()
+                    log_recon_loss = recon_loss.item()
+                else:
+                    # Generator Frozen: Calculate loss for logging but don't backward
+                    with torch.no_grad():
+                         recon_loss, loss_dict = criterion(z_pred, z_target)
+                         log_recon_loss = recon_loss.item()
+                         loss_dict['loss_mel'] = 0.0
+                         if use_gan:
+                            g_loss_adv, g_loss_feat = gan_loss_fn.generator_loss(pred_audio, clean_aligned)
+                            loss_dict['loss_adv'] = g_loss_adv.item()
+                            loss_dict['loss_feat'] = g_loss_feat.item()
             
             # Logging
             postfix = {
@@ -295,25 +311,7 @@ def train(args):
                 
             pbar.set_postfix(postfix)
             
-            if not args.debug:
-                log_dict = {
-                    "train_loss": recon_loss.item(),
-                    "train_loss_recon": loss_dict['loss_recon'],
-                    "train_loss_env": loss_dict.get('loss_env', 0.0), # Use get
-                    "train_pcc": loss_dict.get('pcc', 0.0), # Use get
-                    "lr_g": current_lr_g,
-                    "lr_d": current_lr_d
-                }
-                if 'loss_mel' in loss_dict:
-                    log_dict['train_loss_mel'] = loss_dict['loss_mel']
-                    log_dict['lambda_mel'] = args.lambda_mel
-                
-                if use_gan:
-                    log_dict['train_loss_adv'] = loss_dict['loss_adv']
-                    log_dict['train_loss_feat'] = loss_dict['loss_feat']
-                    log_dict['train_loss_d'] = d_loss.item()
-                    
-                wandb.log(log_dict)
+
             
             # Optional: Overfit check (break early)
             if args.debug and batch_idx > 5:
@@ -322,7 +320,7 @@ def train(args):
         
         # Validation
         if (epoch + 1) % args.val_interval == 0:
-            val_loss, val_sisdr, val_estoi = validate(model, train_loader, criterion, device, args)
+            val_loss, val_sisdr, val_estoi = validate(model, val_loader, criterion, device, args)
             
             # Step Schedulers
             scheduler_g.step(val_loss)
@@ -330,13 +328,7 @@ def train(args):
             
             print(f"Epoch {epoch+1} | Train Loss: {total_loss/len(train_loader):.4f} | Val Loss: {val_loss:.4f} | Val SI-SDR: {val_sisdr:.2f} dB | Val ESTOI: {val_estoi:.4f}")
             
-            if not args.debug:
-                wandb.log({
-                    "val_loss": val_loss,
-                    "val_sisdr": val_sisdr,
-                    "val_estoi": val_estoi,
-                    "epoch": epoch + 1
-                })
+
             
             # Save Checkpoint (Best)
             if val_loss < best_val_loss:
@@ -346,10 +338,7 @@ def train(args):
 
         else:
             print(f"Epoch {epoch+1} | Train Loss: {total_loss/len(train_loader):.4f} | Validation Skipped")
-            if not args.debug:
-                wandb.log({
-                    "epoch": epoch + 1
-                })
+
         
         # Save Latest Checkpoint (Every Epoch)
         torch.save(model.state_dict(), os.path.join(args.checkpoint_dir, "latest_model.pth"))
@@ -362,21 +351,17 @@ def validate(model, loader, criterion, device, args):
     
     # Import for metrics
     from scipy import signal
-    try:
-        from pystoi import stoi
-    except ImportError:
-        stoi = None
-    estoi_scores = []
-    
-    # Import for metrics
-    from scipy import signal
-    try:
-        from pystoi import stoi
-    except ImportError:
-        stoi = None
+    stoi_fn = None
+    if getattr(args, 'estoi', False):
+        try:
+            from pystoi import stoi as _stoi
+            stoi_fn = _stoi
+        except ImportError:
+            print("Warning: pystoi not installed, ESTOI will be skipped.")
     
     with torch.no_grad():
-        for batch_idx, (noisy, eeg, clean) in enumerate(loader):
+        val_pbar = tqdm(loader, desc="Validation")
+        for batch_idx, (noisy, eeg, clean) in enumerate(val_pbar):
             # ... (Existing Loading & Forward) ...
             noisy = noisy.to(device)
             clean = clean.to(device)
@@ -395,28 +380,19 @@ def validate(model, loader, criterion, device, args):
             z_target, _, _, _, _ = model.dac.encode(clean)
             
             # 2. Model Forward (Z Pred)
-            z_pred, _, _, _, _, env_pred = model(noisy, eeg)
+            z_pred, _, _, _, _ = model(noisy, eeg)
             
             # 3. Loss
-            loss, _ = criterion(z_pred, z_target, env_pred, clean)
+            loss, _ = criterion(z_pred, z_target)
             total_loss += loss.item()
             
-            # 4. Neural Decoding & SI-SDR
-            # z_pred is (B, 1024, T)
-            # We need to quantize it and then decode?
-            # Or just decode directly if DAC supports unquantized Z decoding?
-            # Usually dac.decode(z) works on quantized Z. 
-            # Ideally we run it through quantizer to get discrete codes then decode.
-            # z_q, codes, _ = model.dac.quantizer(z_pred, n_quantizers=9) # Check API
+            # 4. Skip decoding if MSE-only mode
+            if args.loss == 'mse':
+                # No audio decoding needed — report zero metrics
+                continue
             
-            # DAC's Quantizer.from_latents(z) returns 5 values
+            # 5. Neural Decoding & SI-SDR (full mode only)
             z_q = model.dac.quantizer(z_pred, n_quantizers=9)[0]
-            # return self.quantize(z) which returns z_q, codes, latents
-            # But we might need exactly 9 layers.
-            
-            # Let's try direct decode first, assuming z_pred is close enough.
-            # But real inference handles quantization.
-            # model.dac.decode(z_q)
             pred_audio = model.dac.decode(z_q)
             
             # SI-SDR Calculation
@@ -458,13 +434,13 @@ def validate(model, loader, criterion, device, args):
                 batch_sisdr.append(score)
                 
                 # ESTOI
-                if stoi is not None:
+                if stoi_fn is not None:
                     # KUL: 16000, Cocktail: 44100
                     if args.dataset == 'kul': fs = 16000
                     else: fs = 44100
                     
                     try:
-                        e_val = stoi(c, p_aligned, fs, extended=True)
+                        e_val = stoi_fn(c, p_aligned, fs, extended=True)
                         batch_estoi.append(e_val)
                     except Exception:
                         pass
@@ -472,10 +448,16 @@ def validate(model, loader, criterion, device, args):
             sisdr_scores.extend(batch_sisdr)
             estoi_scores.extend(batch_estoi)
 
+            # Update progress bar
+            running_loss = total_loss / (batch_idx + 1)
+            running_sisdr = np.mean(sisdr_scores) if len(sisdr_scores) > 0 else 0.0
+            val_pbar.set_postfix({'loss': f'{running_loss:.4f}', 'sisdr': f'{running_sisdr:.2f}'})
+
             if args.debug and batch_idx > 2:
                 break
                 
-    mean_loss = total_loss / len(loader)
+    num_batches = max(batch_idx + 1, 1) if 'batch_idx' in dir() else len(loader)
+    mean_loss = total_loss / num_batches
     mean_sisdr = np.mean(sisdr_scores) if len(sisdr_scores) > 0 else 0.0
     mean_estoi = np.mean(estoi_scores) if len(estoi_scores) > 0 else 0.0
     
@@ -483,32 +465,35 @@ def validate(model, loader, criterion, device, args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root', type=str, default='/workspace/Dataset/kul_all_subjects.lmdb')
-    parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--root', type=str, default='/home/jaliya/eeg_speech/navindu/data/Cocktail_Party/Normalized-Subject-Independent')
+    parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--hidden_dim', type=int, default=256) 
     parser.add_argument('--num_layers', type=int, default=4)
-    parser.add_argument('--gpu', type=int, default=0)
-    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/neurocodec/KUL/mamba-GAN')
+    parser.add_argument('--gpu', type=int, default=1)
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/neurocodec/cocktail/SI/eeg_mod_mel')
     parser.add_argument('--debug', action='store_true', help="Run fast debug mode")
-    parser.add_argument('--dataset', type=str, default='kul', choices=['cocktail', 'kul'], help='Dataset to use')
-    parser.add_argument('--eeg_channels', type=int, default=64, help='Number of EEG channels (128 for Cocktail, 64 for KUL)')
+    parser.add_argument('--dataset', type=str, default='cocktail', choices=['cocktail', 'kul'], help='Dataset to use')
+    parser.add_argument('--eeg_channels', type=int, default=128, help='Number of EEG channels (128 for Cocktail, 64 for KUL)')
     
     parser.add_argument('--evaluate', action='store_true', help="Run validation only")
     parser.add_argument('--noise_cue', action='store_true', help="Use random noise instead of EEG during validation")
     
     parser.add_argument('--backbone', type=str, default='mamba', choices=['mamba', 'transformer'], help='Backbone architecture')
     parser.add_argument('--activation', type=str, default='gelu', choices=['gelu', 'snake', 'relu'], help='Activation function (transformer only)')
-    parser.add_argument('--val_interval', type=int, default=2, help="Validation interval in epochs (default: 1)")
-    parser.add_argument('--lambda_mel', type=float, default=13.0, help="Weight for Mel Spectrogram Loss")
+    parser.add_argument('--dropout', type=float, default=0.3, help='Dropout rate used in EEG encoder and fusion blocks')
+    parser.add_argument('--val_interval', type=int, default=1, help="Validation interval in epochs (default: 1)")
+    parser.add_argument('--lambda_mel', type=float, default=2, help="Weight for Mel Spectrogram Loss")
     parser.add_argument('--mel_start_epoch', type=int, default=0, help="Epoch to start applying Mel Loss")
     parser.add_argument('--val_batches', type=int, default=0, help="Limit number of validation batches (0 = full)")
+    parser.add_argument('--estoi', action='store_true', help="Compute ESTOI during validation (slow, disabled by default)")
     
-    parser.add_argument('--lambda_gan', type=float, default=1.0, help="Weight for GAN Adversarial Loss")
-    parser.add_argument('--lambda_feat', type=float, default=2.0, help="Weight for GAN Feature Matching Loss")
-    parser.add_argument('--gan_start_epoch', type=int, default=0, help="Epoch to start GAN training")
-    parser.add_argument('--disc_warmup_epochs', type=int, default=3, help="Number of epochs to freeze Generator for Discriminator warmup")
+    parser.add_argument('--lambda_gan', type=float, default=0.5, help="Weight for GAN Adversarial Loss")
+    parser.add_argument('--lambda_feat', type=float, default=1.0, help="Weight for GAN Feature Matching Loss")
+    parser.add_argument('--gan_start_epoch', type=int, default=20, help="Epoch to start GAN training")
+    parser.add_argument('--disc_warmup_epochs', type=int, default=0, help="Number of epochs to freeze Generator for Discriminator warmup")
+    parser.add_argument('--loss', type=str, default='full', choices=['mse', 'full'], help="Loss mode: 'mse' = latent MSE only (no decoder), 'full' = MSE + Mel + GAN (requires decoder)")
     
     args = parser.parse_args()
     
@@ -550,7 +535,8 @@ if __name__ == "__main__":
             eeg_in_channels=args.eeg_channels,
             hidden_dim=args.hidden_dim, 
             num_layers=args.num_layers,
-            backbone=args.backbone
+            backbone=args.backbone,
+            dropout=args.dropout
         ).to(device)
         
         checkpoint_path = args.checkpoint_dir if args.checkpoint_dir.endswith('.pth') else os.path.join(args.checkpoint_dir, "best_model.pth")
@@ -563,7 +549,7 @@ if __name__ == "__main__":
             print(f"No checkpoint found at {checkpoint_path}! Running with random weights.")
             
         # Use NeuroCodecLoss for compatibility with validate() function signature
-        criterion = NeuroCodecLoss(lambda_recon=1.0, lambda_env=0.0).to(device)
+        criterion = NeuroCodecLoss(lambda_recon=1.0).to(device)
         
         val_loss, val_sisdr, val_estoi = validate(model, val_loader, criterion, device, args)
         print(f"Validation Result | Loss: {val_loss:.4f} | SI-SDR: {val_sisdr:.2f} dB | ESTOI: {val_estoi:.4f}")

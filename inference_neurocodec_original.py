@@ -72,23 +72,11 @@ def inference(args):
         hidden_dim=args.hidden_dim, 
         num_layers=args.num_layers,
         backbone=args.backbone,
-        activation=args.activation,
-        dropout=args.dropout
+        activation=args.activation
     ).to(device)
     
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
-    state_dict = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
-    try:
-        model.load_state_dict(state_dict)
-    except RuntimeError as e:
-        print("Warning: strict state_dict load failed.")
-        print(e)
-        print("Retrying with strict=False. This will ignore missing/unexpected keys.")
-        incompatible = model.load_state_dict(state_dict, strict=False)
-        if incompatible.missing_keys:
-            print(f"  Missing keys ({len(incompatible.missing_keys)}): {incompatible.missing_keys}")
-        if incompatible.unexpected_keys:
-            print(f"  Unexpected keys ({len(incompatible.unexpected_keys)}): {incompatible.unexpected_keys}")
+    checkpoint = torch.load(args.checkpoint, map_location=device)
+    model.load_state_dict(checkpoint)
     model.eval()
     print("Model Loaded.")
     
@@ -324,7 +312,7 @@ def inference(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', type=str, default='/home/jaliya/eeg_speech/navindu/data/Cocktail_Party/Normalized-Subject-Independent')
-    parser.add_argument('--checkpoint', type=str, default='/home/jaliya/eeg_speech/Julian/NeuroCodec/checkpoints/neurocodec/cocktail/SI/eeg_mod/best_model.pth')
+    parser.add_argument('--checkpoint', type=str, default='/home/jaliya/eeg_speech/Julian/NeuroCodec/checkpoints/neurocodec/cocktail/SI/mse/best_model.pth')
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--subset', type=str, default='val', help="Dataset subset to use (train, val, test)")
     parser.add_argument('--num_samples', type=int, default=10, help="Number of samples to process")
@@ -336,7 +324,6 @@ if __name__ == "__main__":
     parser.add_argument('--eeg_channels', type=int, default=128, help='Number of EEG channels (128 for Cocktail, 64 for KUL)')
     parser.add_argument('--backbone', type=str, default='mamba', choices=['mamba', 'transformer'], help='Backbone architecture')
     parser.add_argument('--activation', type=str, default='gelu', choices=['gelu', 'snake', 'relu'], help='Activation function (transformer only)')
-    parser.add_argument('--dropout', type=float, default=0.3, help='Dropout rate used in EEG encoder and fusion blocks')
     parser.add_argument('--num_layers', type=int, default=4)
     parser.add_argument('--shuffle', action='store_true', default=True, help="Shuffle the dataset to pick random samples")
     
