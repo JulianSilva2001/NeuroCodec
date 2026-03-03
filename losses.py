@@ -14,16 +14,18 @@ class MelSpectrogramLoss(nn.Module):
     Computes L1 distance between log-mel spectrograms.
     Supports multi-scale loss by accepting a list of n_mels and window_lengths.
     
-    Adapted for 16kHz audio.
+    Supports arbitrary sample rates.
     """
     def __init__(self, 
                  sample_rate=16000,
                  n_mels=[80, 512, 1024], 
                  window_lengths=[2048, 512], 
-                 hop_lengths=None, # if None, defaults to window // 4
+                 hop_lengths=None, # None -> window//4, int -> broadcast, list -> per-scale
                  f_min=0.0,
                  f_max=None,
-                 log_base=10.0):
+                 log_base=10.0,
+                 norm='slaney',
+                 mel_scale='htk'):
         super().__init__()
         
         self.transforms = nn.ModuleList()
@@ -70,8 +72,19 @@ class MelSpectrogramLoss(nn.Module):
         if len(n_mels) != len(window_lengths):
             raise ValueError("n_mels list must match window_lengths list length")
 
+        if hop_lengths is None:
+            resolved_hops = [w // 4 for w in window_lengths]
+        elif isinstance(hop_lengths, int):
+            resolved_hops = [hop_lengths] * len(window_lengths)
+        elif isinstance(hop_lengths, list):
+            if len(hop_lengths) != len(window_lengths):
+                raise ValueError("hop_lengths list must match window_lengths list length")
+            resolved_hops = hop_lengths
+        else:
+            raise TypeError("hop_lengths must be None, int, or list")
+
         for i, win_len in enumerate(window_lengths):
-            hop = win_len // 4 if hop_lengths is None else hop_lengths
+            hop = resolved_hops[i]
             
             # Safety check for n_mels vs n_fft
             # n_fft = win_len
@@ -89,11 +102,11 @@ class MelSpectrogramLoss(nn.Module):
                 center=True,
                 pad_mode="reflect",
                 power=2.0,
-                norm='slaney',
+                norm=norm,
                 n_mels=current_n_mels,
                 f_min=f_min,
                 f_max=f_max,
-                mel_scale="htk",
+                mel_scale=mel_scale,
             )
             self.transforms.append(t)
             

@@ -155,12 +155,24 @@ def train(args):
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-2) 
     
     criterion = NeuroCodecLoss(lambda_recon=1.0).to(device)
-    mel_loss_fn = MelSpectrogramLoss(
-        sample_rate=16000,
-        window_lengths=[1024, 512, 256, 128],
-        n_mels=[80, 80, 32, 16],
-        f_max=4000
-    ).to(device)
+    if args.dataset == 'cocktail':
+        # Cocktail: multi-scale mel loss configuration requested by user.
+        cocktail_window_lengths = [32, 64, 128, 256, 512, 1024, 2048]
+        mel_loss_fn = MelSpectrogramLoss(
+            sample_rate=44100,
+            window_lengths=cocktail_window_lengths,
+            hop_lengths=[w // 4 for w in cocktail_window_lengths],  # [8,16,32,64,128,256,512]
+            n_mels=[5, 10, 20, 40, 80, 160, 320],
+            mel_scale='slaney',
+        ).to(device)
+    else:
+        # KUL: keep previous setup unchanged.
+        mel_loss_fn = MelSpectrogramLoss(
+            sample_rate=16000,
+            window_lengths=[1024, 512, 256, 128],
+            n_mels=[80, 80, 32, 16],
+            f_max=4000
+        ).to(device)
     
     # GAN Setup
     discriminator = dac.model.Discriminator(sample_rate=16000).to(device)
@@ -472,7 +484,7 @@ if __name__ == "__main__":
     parser.add_argument('--hidden_dim', type=int, default=256) 
     parser.add_argument('--num_layers', type=int, default=4)
     parser.add_argument('--gpu', type=int, default=1)
-    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/neurocodec/cocktail/SI/eeg_mod_mel')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/neurocodec/cocktail/SI/eeg_mod')
     parser.add_argument('--debug', action='store_true', help="Run fast debug mode")
     parser.add_argument('--dataset', type=str, default='cocktail', choices=['cocktail', 'kul'], help='Dataset to use')
     parser.add_argument('--eeg_channels', type=int, default=128, help='Number of EEG channels (128 for Cocktail, 64 for KUL)')
