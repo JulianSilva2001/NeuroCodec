@@ -154,9 +154,9 @@ class GANLoss(nn.Module):
 
         loss_d = 0
         for x_fake, x_real in zip(d_fake, d_real):
-            # LSGAN: Real -> 1, Fake -> 0
-            loss_d += torch.mean(x_fake[-1] ** 2)
-            loss_d += torch.mean((1 - x_real[-1]) ** 2)
+            # HingeGAN discriminator objective
+            loss_d += torch.mean(F.relu(1 - x_real[-1]))
+            loss_d += torch.mean(F.relu(1 + x_fake[-1]))
         return loss_d
 
     def generator_loss(self, fake, real):
@@ -164,8 +164,8 @@ class GANLoss(nn.Module):
 
         loss_g = 0
         for x_fake in d_fake:
-            # LSGAN: Fake -> 1
-            loss_g += torch.mean((1 - x_fake[-1]) ** 2)
+            # HingeGAN generator objective
+            loss_g += -torch.mean(x_fake[-1])
 
         loss_feature = 0
 

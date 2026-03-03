@@ -155,15 +155,17 @@ def train(args):
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-2) 
     
     criterion = NeuroCodecLoss(lambda_recon=1.0).to(device)
+    # Use dataset-dependent frequency range so losses match the active audio domain.
+    mel_fmax = 4000 if target_fs == 16000 else target_fs // 2
     mel_loss_fn = MelSpectrogramLoss(
-        sample_rate=16000,
+        sample_rate=target_fs,
         window_lengths=[1024, 512, 256, 128],
         n_mels=[80, 80, 32, 16],
-        f_max=4000
+        f_max=mel_fmax
     ).to(device)
     
     # GAN Setup
-    discriminator = dac.model.Discriminator(sample_rate=16000).to(device)
+    discriminator = dac.model.Discriminator(sample_rate=target_fs).to(device)
     gan_loss_fn = GANLoss(discriminator).to(device)
     
     # Optimizers
@@ -359,6 +361,8 @@ def validate(model, loader, criterion, device, args):
         except ImportError:
             print("Warning: pystoi not installed, ESTOI will be skipped.")
     
+    target_fs = 16000 if args.dataset == 'kul' else 44100
+
     with torch.no_grad():
         val_pbar = tqdm(loader, desc="Validation")
         for batch_idx, (noisy, eeg, clean) in enumerate(val_pbar):
@@ -435,12 +439,8 @@ def validate(model, loader, criterion, device, args):
                 
                 # ESTOI
                 if stoi_fn is not None:
-                    # KUL: 16000, Cocktail: 44100
-                    if args.dataset == 'kul': fs = 16000
-                    else: fs = 44100
-                    
                     try:
-                        e_val = stoi_fn(c, p_aligned, fs, extended=True)
+                        e_val = stoi_fn(c, p_aligned, target_fs, extended=True)
                         batch_estoi.append(e_val)
                     except Exception:
                         pass
@@ -465,17 +465,17 @@ def validate(model, loader, criterion, device, args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root', type=str, default='/home/jaliya/eeg_speech/navindu/data/Cocktail_Party/Normalized-Subject-Independent')
+    parser.add_argument('--root', type=str, default='/home/senum/projects/EEG_SPEECH/NeuroCodec/KUL-mix/KUL_eeg/kul_all_subjects.lmdb')
     parser.add_argument('--batch_size', type=int, default=4)
-    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--hidden_dim', type=int, default=256) 
     parser.add_argument('--num_layers', type=int, default=4)
-    parser.add_argument('--gpu', type=int, default=1)
-    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/neurocodec/cocktail/SI/eeg_mod_mel')
+    parser.add_argument('--gpu', type=int, default=0)
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/neurocodec/KUL/SI/eeg_mod_mse_gan')
     parser.add_argument('--debug', action='store_true', help="Run fast debug mode")
-    parser.add_argument('--dataset', type=str, default='cocktail', choices=['cocktail', 'kul'], help='Dataset to use')
-    parser.add_argument('--eeg_channels', type=int, default=128, help='Number of EEG channels (128 for Cocktail, 64 for KUL)')
+    parser.add_argument('--dataset', type=str, default='kul', choices=['cocktail', 'kul'], help='Dataset to use')
+    parser.add_argument('--eeg_channels', type=int, default=64, help='Number of EEG channels (128 for Cocktail, 64 for KUL)')
     
     parser.add_argument('--evaluate', action='store_true', help="Run validation only")
     parser.add_argument('--noise_cue', action='store_true', help="Use random noise instead of EEG during validation")
@@ -484,15 +484,15 @@ if __name__ == "__main__":
     parser.add_argument('--activation', type=str, default='gelu', choices=['gelu', 'snake', 'relu'], help='Activation function (transformer only)')
     parser.add_argument('--dropout', type=float, default=0.3, help='Dropout rate used in EEG encoder and fusion blocks')
     parser.add_argument('--val_interval', type=int, default=1, help="Validation interval in epochs (default: 1)")
-    parser.add_argument('--lambda_mel', type=float, default=2, help="Weight for Mel Spectrogram Loss")
+    parser.add_argument('--lambda_mel', type=float, default=10, help="Weight for Mel Spectrogram Loss")
     parser.add_argument('--mel_start_epoch', type=int, default=0, help="Epoch to start applying Mel Loss")
     parser.add_argument('--val_batches', type=int, default=0, help="Limit number of validation batches (0 = full)")
     parser.add_argument('--estoi', action='store_true', help="Compute ESTOI during validation (slow, disabled by default)")
     
     parser.add_argument('--lambda_gan', type=float, default=0.5, help="Weight for GAN Adversarial Loss")
     parser.add_argument('--lambda_feat', type=float, default=1.0, help="Weight for GAN Feature Matching Loss")
-    parser.add_argument('--gan_start_epoch', type=int, default=20, help="Epoch to start GAN training")
-    parser.add_argument('--disc_warmup_epochs', type=int, default=0, help="Number of epochs to freeze Generator for Discriminator warmup")
+    parser.add_argument('--gan_start_epoch', type=int, default=0, help="Epoch to start GAN training")
+    parser.add_argument('--disc_warmup_epochs', type=int, default=1, help="Number of epochs to freeze Generator for Discriminator warmup")
     parser.add_argument('--loss', type=str, default='full', choices=['mse', 'full'], help="Loss mode: 'mse' = latent MSE only (no decoder), 'full' = MSE + Mel + GAN (requires decoder)")
     
     args = parser.parse_args()
@@ -508,6 +508,7 @@ if __name__ == "__main__":
         print(f"Dataset: {args.dataset.upper()}")
         
         # Load Data
+        target_fs = 16000 if args.dataset == 'kul' else 44100
         if args.dataset == 'cocktail':
              val_loader = load_NeuroCodecDataset(root=args.root, subset='val', batch_size=args.batch_size, num_gpus=1)
         elif args.dataset == 'kul':
@@ -516,7 +517,7 @@ if __name__ == "__main__":
                 subset='val', 
                 batch_size=args.batch_size, 
                 num_gpus=1, 
-                target_fs=16000, # Hardcoded or use args
+                target_fs=target_fs,
                 original_fs=16000 # Correct FS
              )
              # args.eeg_channels should be set by user or we trust default?
