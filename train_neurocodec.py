@@ -155,12 +155,24 @@ def train(args):
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-2) 
     
     criterion = NeuroCodecLoss(lambda_recon=1.0).to(device)
-    # Use dataset-dependent frequency range so losses match the active audio domain.
-    mel_fmax = 4000 if target_fs == 16000 else target_fs // 2
+    # Use paper full multi-scale mel schedule for Cocktail (44.1kHz).
+    if args.dataset == 'cocktail':
+        mel_window_lengths = [32, 64, 128, 256, 512, 1024, 2048]
+        # Fixed bins from empirical torchaudio-valid limits for sr=44.1k/f_max=20k.
+        mel_n_mels = [5, 8, 15, 29, 57, 112, 222]
+        mel_hop_lengths = [w // 4 for w in mel_window_lengths]
+        mel_fmax = 20000.0
+    else:
+        mel_window_lengths = [1024, 512, 256, 128]
+        mel_n_mels = [80, 80, 32, 16]
+        mel_hop_lengths = [w // 4 for w in mel_window_lengths]
+        mel_fmax = 4000.0
+
     mel_loss_fn = MelSpectrogramLoss(
         sample_rate=target_fs,
-        window_lengths=[1024, 512, 256, 128],
-        n_mels=[80, 80, 32, 16],
+        window_lengths=mel_window_lengths,
+        n_mels=mel_n_mels,
+        hop_lengths=mel_hop_lengths,
         f_max=mel_fmax
     ).to(device)
     
@@ -465,34 +477,34 @@ def validate(model, loader, criterion, device, args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root', type=str, default='/home/senum/projects/EEG_SPEECH/NeuroCodec/KUL-mix/KUL_eeg/kul_all_subjects.lmdb')
+    parser.add_argument('--root', type=str, default='/workspace/NeuroCodec/CocktailParty/2s')
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--hidden_dim', type=int, default=256) 
-    parser.add_argument('--num_layers', type=int, default=4)
+    parser.add_argument('--num_layers', type=int, default=6)
     parser.add_argument('--gpu', type=int, default=0)
-    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/neurocodec/KUL/SI/eeg_mod_mse_gan')
+    parser.add_argument('--checkpoint_dir', type=str, default='/workspace/NeuroCodec/checkpoints/neurocodec/KUL/SI/before_gan')
     parser.add_argument('--debug', action='store_true', help="Run fast debug mode")
-    parser.add_argument('--dataset', type=str, default='kul', choices=['cocktail', 'kul'], help='Dataset to use')
-    parser.add_argument('--eeg_channels', type=int, default=64, help='Number of EEG channels (128 for Cocktail, 64 for KUL)')
+    parser.add_argument('--dataset', type=str, default='cocktail', choices=['cocktail', 'kul'], help='Dataset to use')
+    parser.add_argument('--eeg_channels', type=int, default=128, help='Number of EEG channels (128 for Cocktail, 64 for KUL)')
     
     parser.add_argument('--evaluate', action='store_true', help="Run validation only")
     parser.add_argument('--noise_cue', action='store_true', help="Use random noise instead of EEG during validation")
     
     parser.add_argument('--backbone', type=str, default='mamba', choices=['mamba', 'transformer'], help='Backbone architecture')
     parser.add_argument('--activation', type=str, default='gelu', choices=['gelu', 'snake', 'relu'], help='Activation function (transformer only)')
-    parser.add_argument('--dropout', type=float, default=0.3, help='Dropout rate used in EEG encoder and fusion blocks')
+    parser.add_argument('--dropout', type=float, default=0.5, help='Dropout rate used in EEG encoder and fusion blocks')
     parser.add_argument('--val_interval', type=int, default=1, help="Validation interval in epochs (default: 1)")
-    parser.add_argument('--lambda_mel', type=float, default=10, help="Weight for Mel Spectrogram Loss")
+    parser.add_argument('--lambda_mel', type=float, default=13, help="Weight for Mel Spectrogram Loss")
     parser.add_argument('--mel_start_epoch', type=int, default=0, help="Epoch to start applying Mel Loss")
     parser.add_argument('--val_batches', type=int, default=0, help="Limit number of validation batches (0 = full)")
     parser.add_argument('--estoi', action='store_true', help="Compute ESTOI during validation (slow, disabled by default)")
     
-    parser.add_argument('--lambda_gan', type=float, default=0.5, help="Weight for GAN Adversarial Loss")
-    parser.add_argument('--lambda_feat', type=float, default=1.0, help="Weight for GAN Feature Matching Loss")
+    parser.add_argument('--lambda_gan', type=float, default=1, help="Weight for GAN Adversarial Loss")
+    parser.add_argument('--lambda_feat', type=float, default=2, help="Weight for GAN Feature Matching Loss")
     parser.add_argument('--gan_start_epoch', type=int, default=0, help="Epoch to start GAN training")
-    parser.add_argument('--disc_warmup_epochs', type=int, default=1, help="Number of epochs to freeze Generator for Discriminator warmup")
+    parser.add_argument('--disc_warmup_epochs', type=int, default=0, help="Number of epochs to freeze Generator for Discriminator warmup")
     parser.add_argument('--loss', type=str, default='full', choices=['mse', 'full'], help="Loss mode: 'mse' = latent MSE only (no decoder), 'full' = MSE + Mel + GAN (requires decoder)")
     
     args = parser.parse_args()

@@ -5,10 +5,11 @@ import numpy as np
 from torch.utils.data.distributed import DistributedSampler
 
 class NeuroCodecDataset(Dataset):
-    def __init__(self, root, mode, subject=None, return_subject=False):
+    def __init__(self, root, mode, subject=None, return_subject=False, return_index=False):
         super().__init__()
         self.root = root
         self.return_subject = return_subject
+        self.return_index = return_index
         # Handle path dynamically based on input root
         if root.endswith('new'):
              self.file_path = root
@@ -110,6 +111,16 @@ class NeuroCodecDataset(Dataset):
         c_d = c_d.astype(np.float32)
         e_d = e_d.astype(np.float32)
 
+        if self.return_subject and self.return_index:
+            if self.has_subjects:
+                subject_key = f'subjects_{self.mode}='
+                subject_data = self.subject_f[subject_key]
+                subject_val = subject_data[true_idx]
+                subject_val = int(subject_val)
+            else:
+                subject_val = -1
+            return torch.from_numpy(n_d), torch.from_numpy(e_d), torch.from_numpy(c_d), subject_val, int(true_idx)
+
         if self.return_subject:
             if self.has_subjects:
                 subject_key = f'subjects_{self.mode}='
@@ -119,6 +130,9 @@ class NeuroCodecDataset(Dataset):
             else:
                 subject_val = -1
             return torch.from_numpy(n_d), torch.from_numpy(e_d), torch.from_numpy(c_d), subject_val
+
+        if self.return_index:
+            return torch.from_numpy(n_d), torch.from_numpy(e_d), torch.from_numpy(c_d), int(true_idx)
 
         return torch.from_numpy(n_d), torch.from_numpy(e_d), torch.from_numpy(c_d)
         return torch.from_numpy(n_d).float(), torch.from_numpy(e_d).float(), torch.from_numpy(c_d).float()
@@ -133,11 +147,11 @@ class NeuroCodecDataset(Dataset):
         if hasattr(self, 'subject_f') and self.subject_f is not None:
             self.subject_f.close()
 
-def load_NeuroCodecDataset(root, subset='train', batch_size=4, num_gpus=1, shuffle=None, return_subject=False):
+def load_NeuroCodecDataset(root, subset='train', batch_size=4, num_gpus=1, shuffle=None, return_subject=False, return_index=False):
     """
     Loader for Cocktail Party Dataset (H5)
     """
-    dataset = NeuroCodecDataset(root, mode=subset, return_subject=return_subject)
+    dataset = NeuroCodecDataset(root, mode=subset, return_subject=return_subject, return_index=return_index)
     
     sampler = None
     if num_gpus > 1:
@@ -191,7 +205,7 @@ import pickle
 import torchaudio
 
 class KULNeuroCodecDataset(Dataset):
-    def __init__(self, lmdb_path, indices=None, target_fs=44100, original_fs=8000, return_subject=False):
+    def __init__(self, lmdb_path, indices=None, target_fs=44100, original_fs=8000, return_subject=False, return_index=False):
         super().__init__()
         self.lmdb_path = lmdb_path
         self.indices = indices # List of LMDB keys (integers)
@@ -200,6 +214,7 @@ class KULNeuroCodecDataset(Dataset):
         self.target_fs = target_fs
         self.original_fs = original_fs
         self.return_subject = return_subject
+        self.return_index = return_index
         
         # Resampler: original_fs -> target_fs
         if self.original_fs != self.target_fs:
@@ -265,6 +280,16 @@ class KULNeuroCodecDataset(Dataset):
         # Let's verify KUL range. Usually uV. 
         # For now return raw, user can normalize in training if needed.
 
+        if self.return_subject and self.return_index:
+            subject_val = data.get('subject', None)
+            if isinstance(subject_val, (bytes, bytearray)):
+                subject_val = subject_val.decode('utf-8', errors='ignore')
+            if subject_val is None:
+                subject_val = "Unknown"
+            else:
+                subject_val = str(subject_val)
+            return mix_resampled, eeg, clean_resampled, subject_val, int(real_idx)
+
         if self.return_subject:
             subject_val = data.get('subject', None)
             if isinstance(subject_val, (bytes, bytearray)):
@@ -275,9 +300,12 @@ class KULNeuroCodecDataset(Dataset):
                 subject_val = str(subject_val)
             return mix_resampled, eeg, clean_resampled, subject_val
 
+        if self.return_index:
+            return mix_resampled, eeg, clean_resampled, int(real_idx)
+
         return mix_resampled, eeg, clean_resampled
 
-def load_KUL_NeuroCodecDataset(lmdb_path, subset='train', batch_size=4, num_gpus=1, target_fs=44100, original_fs=16000, shuffle=None, return_subject=False):
+def load_KUL_NeuroCodecDataset(lmdb_path, subset='train', batch_size=4, num_gpus=1, target_fs=44100, original_fs=16000, shuffle=None, return_subject=False, return_index=False):
     """
     Loader for KUL Dataset (LMDB) with Subject-wise Splitting
     """
@@ -373,7 +401,14 @@ def load_KUL_NeuroCodecDataset(lmdb_path, subset='train', batch_size=4, num_gpus
     
     print(f"Subset '{subset}': {len(target_indices)} samples (Subjects: {train_subj if subset=='train' else (val_subj if subset=='val' else test_subj)})")
     
-    dataset = KULNeuroCodecDataset(lmdb_path, indices=target_indices, target_fs=target_fs, original_fs=original_fs, return_subject=return_subject)
+    dataset = KULNeuroCodecDataset(
+        lmdb_path,
+        indices=target_indices,
+        target_fs=target_fs,
+        original_fs=original_fs,
+        return_subject=return_subject,
+        return_index=return_index
+    )
     
     sampler = None
     if num_gpus > 1:

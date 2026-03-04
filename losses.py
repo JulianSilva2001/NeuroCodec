@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import nn
 import torchaudio
+import warnings
 
 from audiotools import AudioSignal
 from audiotools import STFTParams
@@ -20,10 +21,12 @@ class MelSpectrogramLoss(nn.Module):
                  sample_rate=16000,
                  n_mels=[80, 512, 1024], 
                  window_lengths=[2048, 512], 
-                 hop_lengths=None, # if None, defaults to window // 4
+                 hop_lengths=None, # None -> window//4, int -> broadcast, list -> per-scale
                  f_min=0.0,
                  f_max=None,
-                 log_base=10.0):
+                 log_base=10.0,
+                 norm='slaney',
+                 mel_scale='htk'):
         super().__init__()
         
         self.transforms = nn.ModuleList()
@@ -70,8 +73,19 @@ class MelSpectrogramLoss(nn.Module):
         if len(n_mels) != len(window_lengths):
             raise ValueError("n_mels list must match window_lengths list length")
 
+        if hop_lengths is None:
+            resolved_hops = [w // 4 for w in window_lengths]
+        elif isinstance(hop_lengths, int):
+            resolved_hops = [hop_lengths] * len(window_lengths)
+        elif isinstance(hop_lengths, list):
+            if len(hop_lengths) != len(window_lengths):
+                raise ValueError("hop_lengths list must match window_lengths list length")
+            resolved_hops = hop_lengths
+        else:
+            raise TypeError("hop_lengths must be None, int, or list")
+
         for i, win_len in enumerate(window_lengths):
-            hop = win_len // 4 if hop_lengths is None else hop_lengths
+            hop = resolved_hops[i]
             
             # Safety check for n_mels vs n_fft
             # n_fft = win_len
@@ -80,6 +94,35 @@ class MelSpectrogramLoss(nn.Module):
             current_n_mels = min(n_mels[i], max_mels)
             if current_n_mels != n_mels[i]:
                 print(f"Warning: n_mels={n_mels[i]} too large for win_len={win_len}. Clamping to {current_n_mels}.")
+
+            # Keep f_max strictly below Nyquist for numerical robustness.
+            nyquist = sample_rate / 2.0
+            current_f_max = f_max if f_max is not None else nyquist - 1.0
+            current_f_max = min(current_f_max, nyquist - 1.0)
+
+            # Torchaudio can still produce empty mel filters for some scale/config combos.
+            # Reduce n_mels until the filterbank has no all-zero bands.
+            n_freqs = n_fft // 2 + 1
+            while current_n_mels > 1:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    fb = torchaudio.functional.melscale_fbanks(
+                        n_freqs=n_freqs,
+                        f_min=f_min,
+                        f_max=current_f_max,
+                        n_mels=current_n_mels,
+                        sample_rate=sample_rate,
+                        norm=norm,
+                        mel_scale=mel_scale,
+                    )
+                if not (fb.max(dim=0).values == 0).any():
+                    break
+                current_n_mels -= 1
+            if current_n_mels != n_mels[i]:
+                print(
+                    f"Info: adjusted n_mels for win_len={win_len} "
+                    f"from {n_mels[i]} to {current_n_mels} to avoid empty mel filters."
+                )
             
             t = torchaudio.transforms.MelSpectrogram(
                 sample_rate=sample_rate,
@@ -89,11 +132,11 @@ class MelSpectrogramLoss(nn.Module):
                 center=True,
                 pad_mode="reflect",
                 power=2.0,
-                norm='slaney',
+                norm=norm,
                 n_mels=current_n_mels,
                 f_min=f_min,
-                f_max=f_max,
-                mel_scale="htk",
+                f_max=current_f_max,
+                mel_scale=mel_scale,
             )
             self.transforms.append(t)
             

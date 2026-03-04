@@ -58,11 +58,13 @@ def inference(args):
         dac_model_type = '16khz'
         target_fs = 16000
         eeg_channels = 64
+        plot_fmax = 4000
         print(f"Info: Using KUL configuration (DAC: 16khz, EEG: 64ch)")
     else:
         dac_model_type = '44khz'
         target_fs = 44100
         eeg_channels = 128
+        plot_fmax = 20000
         
     # 1. Load Model
     print(f"Loading Model from {args.checkpoint}...")
@@ -102,7 +104,8 @@ def inference(args):
             target_fs=target_fs,
             original_fs=16000,
             shuffle=args.shuffle,
-            return_subject=True
+            return_subject=True,
+            return_index=True
         )
     else:
         val_loader = load_NeuroCodecDataset(
@@ -111,7 +114,8 @@ def inference(args):
             batch_size=1, 
             num_gpus=1,
             shuffle=args.shuffle,
-            return_subject=True
+            return_subject=True,
+            return_index=True
         )
     
     # 3. Process Multiple Samples
@@ -126,11 +130,19 @@ def inference(args):
             break
 
         subject = None
-        if isinstance(batch, (list, tuple)) and len(batch) == 4:
+        segment = None
+        if isinstance(batch, (list, tuple)) and len(batch) == 5:
+            noisy, eeg, clean, subject, segment = batch
+        elif isinstance(batch, (list, tuple)) and len(batch) == 4:
             noisy, eeg, clean, subject = batch
         else:
             noisy, eeg, clean = batch
         print(f"  Subject: {format_subject(subject)}")
+        if segment is not None:
+            if torch.is_tensor(segment):
+                segment = int(segment.squeeze().item())
+            print(f"  Segment: {segment}")
+        file_id = f"seg{segment}" if segment is not None else str(i)
             
         noisy = noisy.to(device)
         eeg = eeg.to(device)
@@ -163,9 +175,9 @@ def inference(args):
             pred_audio = model.dac.decode(z_q)
             
         # 4. Save Audio
-        output_dir = "results/NeuroCodec/cocktail_SI/mse/Inference"
+        output_dir = "results/NeuroCodec/cocktail_SI/final_20000/Inference"
         if args.noise_cue:
-            output_dir = "results/NeuroCodec/cocktail_SI/mse/Inference_NoiseCue"
+            output_dir = "results/NeuroCodec/cocktail_SI/final_20000/Inference_NoiseCue"
             
         os.makedirs(output_dir, exist_ok=True)
         
@@ -181,11 +193,6 @@ def inference(args):
         def to_numpy(t):
             return t.detach().cpu().numpy().squeeze()
             
-        sf.write(f"{output_dir}/input_noisy_{i}.wav", to_numpy(noisy), target_fs)
-        sf.write(f"{output_dir}/target_clean_{i}.wav", to_numpy(clean), target_fs)
-        sf.write(f"{output_dir}/prediction_{i}.wav", to_numpy(pred_audio), target_fs)
-        print(f"Saved audio_{i} to {output_dir}")
-        
         # 5. Calculate Metrics
         # 5. Calculate Metrics with Alignment
         clean_np = clean.cpu().numpy().squeeze()
@@ -283,48 +290,54 @@ def inference(args):
         print(f"  Output ESTOI:     {estoi_val:.4f}")
         print(f"  Improvement:      {si_sdr_pred - si_sdr_orig:.2f} dB")
         
-        
-        # 6.5 Calculate Filtered Interferer
-        # Re-calc matches lengths of filtered signals
-        min_len_filt = min(len(noisy_filt), len(clean_filt))
-        interferer_filt = noisy_filt[:min_len_filt] - clean_filt[:min_len_filt]
+        if estoi_val > args.estoi_save_threshold:
+            sf.write(f"{output_dir}/input_noisy_{file_id}.wav", to_numpy(noisy), target_fs)
+            sf.write(f"{output_dir}/target_clean_{file_id}.wav", to_numpy(clean), target_fs)
+            sf.write(f"{output_dir}/prediction_{file_id}.wav", to_numpy(pred_audio), target_fs)
+            print(f"Saved audio_{file_id} to {output_dir} (ESTOI {estoi_val:.4f} > {args.estoi_save_threshold:.2f})")
 
-        # 7. Plotting (Using Filtered Signals)
-        import matplotlib.pyplot as plt
-        import librosa.display
-        
-        fig, ax = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
-        
-        def plot_spec(y, title, ax_idx):
-            D = librosa.stft(y, n_fft=1024, hop_length=256)
-            S_db = librosa.amplitude_to_db(np.abs(D), ref=np.max)
-            img = librosa.display.specshow(S_db, y_axis='linear', x_axis='time', sr=target_fs, 
-                                         hop_length=256, fmax=4000, ax=ax[ax_idx]) # fmax=4000 matches filter
-            ax[ax_idx].set_title(title)
-            ax[ax_idx].set_ylim(0, 4000) # Zoom in to 4kHz
-            return img
+            # 6.5 Calculate Interferer for plotting (full-band)
+            min_len_plot = min(len(noisy_np), len(clean_np))
+            interferer_plot = noisy_np[:min_len_plot] - clean_np[:min_len_plot]
 
-        # Use filtered signals
-        plot_spec(noisy_filt[:min_len_filt], "Mixture (0-4kHz)", 0)
-        plot_spec(clean_filt[:min_len_filt], "Target (0-4kHz)", 1)
-        plot_spec(interferer_filt, "Interferer (0-4kHz)", 2)
-        plot_spec(pred_aligned_filt, "Reconstruction (0-4kHz)", 3)
-        
-        plt.tight_layout()
-        plt.savefig(f"{output_dir}/inference_plot_{i}.png")
-        plt.close()
-        print(f"Saved plot_{i} to {output_dir}")
-        
-        # 8. Save Filtered Audio
-        # Save aligned filtered prediction
-        sf.write(f"{output_dir}/audio_{i}_pred_filtered.wav", pred_aligned_filt, target_fs)
-        # Save aligned filtered clean for comparison
-        sf.write(f"{output_dir}/audio_{i}_clean_filtered.wav", clean_aligned_pred_filt, target_fs)
+            # 7. Plotting (Using Filtered Signals)
+            import matplotlib.pyplot as plt
+            import librosa.display
+            
+            fig, ax = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
+            
+            def plot_spec(y, title, ax_idx):
+                D = librosa.stft(y, n_fft=1024, hop_length=256)
+                S_db = librosa.amplitude_to_db(np.abs(D), ref=np.max)
+                img = librosa.display.specshow(S_db, y_axis='linear', x_axis='time', sr=target_fs, 
+                                             hop_length=256, fmax=plot_fmax, ax=ax[ax_idx])
+                ax[ax_idx].set_title(title)
+                ax[ax_idx].set_ylim(0, plot_fmax)
+                return img
+
+            # Use full-band signals for spectrogram visualization
+            plot_spec(noisy_np[:min_len_plot], f"Mixture (0-{plot_fmax}Hz)", 0)
+            plot_spec(clean_np[:min_len_plot], f"Target (0-{plot_fmax}Hz)", 1)
+            plot_spec(interferer_plot, f"Interferer (0-{plot_fmax}Hz)", 2)
+            plot_spec(pred_aligned, f"Reconstruction (0-{plot_fmax}Hz)", 3)
+            
+            plt.tight_layout()
+            plt.savefig(f"{output_dir}/inference_plot_{file_id}.png")
+            plt.close()
+            print(f"Saved plot_{file_id} to {output_dir}")
+            
+            # 8. Save Filtered Audio
+            # Save aligned filtered prediction
+            sf.write(f"{output_dir}/audio_{file_id}_pred_filtered.wav", pred_aligned_filt, target_fs)
+            # Save aligned filtered clean for comparison
+            sf.write(f"{output_dir}/audio_{file_id}_clean_filtered.wav", clean_aligned_pred_filt, target_fs)
+        else:
+            print(f"Skipped saving sample {file_id} (ESTOI {estoi_val:.4f} <= {args.estoi_save_threshold:.2f})")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root', type=str, default='/home/senum/projects/EEG_SPEECH/NeuroCodec/KUL-mix/KUL_eeg/kul_all_subjects.lmdb')
-    parser.add_argument('--checkpoint', type=str, default='/home/senum/projects/EEG_SPEECH/NeuroCodec/checkpoints/neurocodec/KUL/SI/latest/best_model.pth')
+    parser.add_argument('--root', type=str, default='/workspace/NeuroCodec/CocktailParty/2s')
+    parser.add_argument('--checkpoint', type=str, default='/workspace/NeuroCodec/checkpoints/neurocodec/KUL/SI/before_gan/latest_model.pth')
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--subset', type=str, default='val', help="Dataset subset to use (train, val, test)")
     parser.add_argument('--num_samples', type=int, default=10, help="Number of samples to process")
@@ -332,13 +345,14 @@ if __name__ == "__main__":
     parser.add_argument('--hidden_dim', type=int, default=256, help="Hidden dimension of the model (default: 128)")
     parser.add_argument('--use_fast_bss', action='store_true', default=True, help="Use fast_bss_eval for SIR-SDR")
     
-    parser.add_argument('--dataset', type=str, default='kul', choices=['cocktail', 'kul'], help='Dataset to use')
-    parser.add_argument('--eeg_channels', type=int, default=64, help='Number of EEG channels (128 for Cocktail, 64 for KUL)')
+    parser.add_argument('--dataset', type=str, default='cocktail', choices=['cocktail', 'kul'], help='Dataset to use')
+    parser.add_argument('--eeg_channels', type=int, default=128, help='Number of EEG channels (128 for Cocktail, 64 for KUL)')
     parser.add_argument('--backbone', type=str, default='mamba', choices=['mamba', 'transformer'], help='Backbone architecture')
     parser.add_argument('--activation', type=str, default='gelu', choices=['gelu', 'snake', 'relu'], help='Activation function (transformer only)')
-    parser.add_argument('--dropout', type=float, default=0.3, help='Dropout rate used in EEG encoder and fusion blocks')
-    parser.add_argument('--num_layers', type=int, default=4)
+    parser.add_argument('--dropout', type=float, default=0.5, help='Dropout rate used in EEG encoder and fusion blocks')
+    parser.add_argument('--num_layers', type=int, default=6)
     parser.add_argument('--shuffle', action='store_true', default=True, help="Shuffle the dataset to pick random samples")
+    parser.add_argument('--estoi_save_threshold', type=float, default=0.75, help='Only save files for samples with ESTOI greater than this threshold')
     
     args = parser.parse_args()
     
