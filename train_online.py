@@ -601,6 +601,13 @@ def train(args):
     scheduler_g   = optim.lr_scheduler.ReduceLROnPlateau(optimizer_g, mode='min', factor=0.5, patience=5)
     scheduler_d   = optim.lr_scheduler.ReduceLROnPlateau(optimizer_d, mode='min', factor=0.5, patience=5)
 
+    # ── Phase boundaries (derived from phase args) ────────────────────────────
+    # Phase 1: MSE only             (epochs 0 .. phase1_epochs-1)
+    # Phase 2: MSE + Mel            (epochs phase1_epochs .. phase1_epochs+phase2_epochs-1)
+    # Phase 3: MSE + Mel + GAN      (epochs phase1_epochs+phase2_epochs .. end)
+    phase2_start = args.phase1_epochs
+    phase3_start = args.phase1_epochs + args.phase2_epochs
+
     best_val_loss = float('inf')
     start_epoch   = 0
 
@@ -656,13 +663,27 @@ def train(args):
         pseudo_rms_sum = 0.0
         log_every      = 50
 
-        use_gan         = epoch >= args.gan_start_epoch
-        train_generator = epoch >= args.disc_warmup_epochs
+        # ── Determine active training phase ───────────────────────────────────
+        if epoch < phase2_start:
+            current_phase        = 1
+            effective_lambda_mel = 0.0
+            use_gan              = False
+        elif epoch < phase3_start:
+            current_phase        = 2
+            effective_lambda_mel = args.lambda_mel
+            use_gan              = False
+        else:
+            current_phase        = 3
+            effective_lambda_mel = args.lambda_mel
+            use_gan              = True
+
+        train_generator = not use_gan or epoch >= (phase3_start + args.disc_warmup_epochs)
 
         current_lr = optimizer_g.param_groups[0]['lr']
+        phase_tag  = f"Ph{current_phase}:{'MSE' if current_phase==1 else 'MSE+Mel' if current_phase==2 else 'GAN'}"
         pbar       = tqdm(
             train_loader,
-            desc=f"Epoch {epoch+1}/{args.epochs}  [LR_G {current_lr:.1e}]",
+            desc=f"Epoch {epoch+1}/{args.epochs}  [{phase_tag}  LR_G {current_lr:.1e}]",
         )
 
         for batch_idx, (noisy, eeg, clean) in enumerate(pbar):
@@ -684,7 +705,7 @@ def train(args):
                 window_samples, eeg_window, hop_samples, eeg_hop, hop_dac,
                 criterion, mel_criterion, device,
                 lambda_latent=args.lambda_latent,
-                lambda_mel=args.lambda_mel,
+                lambda_mel=effective_lambda_mel,
                 gan_loss_fn=gan_loss_fn,
                 lambda_gan=args.lambda_gan,
                 lambda_feat=args.lambda_feat,
@@ -732,7 +753,7 @@ def train(args):
             model, val_loader, criterion, mel_criterion, device, args,
             window_samples, eeg_window, hop_samples, eeg_hop, hop_dac,
             lambda_latent=args.lambda_latent,
-            lambda_mel=args.lambda_mel,
+            lambda_mel=effective_lambda_mel,
         )
         scheduler_g.step(val_loss)
         scheduler_d.step(val_loss)
@@ -742,7 +763,7 @@ def train(args):
         spk_gain  = val_sisdr - val_sisdr_eeg
         d_info    = f" | D {avg_d:.4f}" if use_gan else ""
         print(
-            f"Epoch {epoch+1:3d} | "
+            f"Epoch {epoch+1:3d} [{phase_tag}] | "
             f"Train {avg_train:.4f}{d_info} | Val {val_loss:.4f} | "
             f"Cold {val_cold:.4f} | Steady {val_steady:.4f} | "
             f"SI-SDR {val_sisdr:.2f} dB (EEG-only {val_sisdr_eeg:.2f} dB, gain {spk_gain:+.2f} dB)"
@@ -814,15 +835,24 @@ if __name__ == "__main__":
     parser.add_argument("--num_train_subjects", type=int, default=None,
                         help="Limit training to first N subjects (e.g. 7 for quick checks; default=None uses all)")
 
+    # ── Automatic phase scheduling ─────────────────────────────────────────
+    # Phase 1: MSE only          (epochs 0 .. phase1_epochs-1)
+    # Phase 2: MSE + Mel         (epochs phase1_epochs .. phase1_epochs+phase2_epochs-1)
+    # Phase 3: MSE + Mel + GAN   (epochs phase1_epochs+phase2_epochs .. end)
+    parser.add_argument("--phase1_epochs",  type=int, default=5,
+                        help="Epochs to train with MSE loss only (default 5)")
+    parser.add_argument("--phase2_epochs",  type=int, default=5,
+                        help="Epochs to train with MSE + Mel loss before enabling GAN (default 5)")
+
     # ── GAN hyperparameters ────────────────────────────────────────────────
     parser.add_argument("--lambda_gan",        type=float, default=0.5,
                         help="Weight for GAN adversarial loss (default 0.5)")
     parser.add_argument("--lambda_feat",       type=float, default=1.0,
                         help="Weight for GAN feature-matching loss (default 1.0)")
     parser.add_argument("--gan_start_epoch",   type=int,   default=0,
-                        help="Epoch at which GAN training activates (default 0 = from the start)")
+                        help="(legacy, ignored when --phase1_epochs/--phase2_epochs are set)")
     parser.add_argument("--disc_warmup_epochs",type=int,   default=0,
-                        help="Epochs to train discriminator only before enabling generator GAN loss (default 0)")
+                        help="Extra epochs at Phase-3 start to warm up discriminator before enabling generator GAN loss (default 0)")
 
     args = parser.parse_args()
     train(args)

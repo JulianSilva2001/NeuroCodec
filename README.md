@@ -69,7 +69,19 @@ data/
 
 ### Online (Causal Streaming) Training
 
-The primary training script is `train_online.py`, which implements the causal sliding-window two-pass strategy.
+The primary training script is `train_online.py`, which implements the causal sliding-window two-pass strategy with **automatic 3-phase curriculum training**.
+
+#### Three-Phase Training Schedule
+
+Training progresses through three phases automatically — no manual restarts needed:
+
+| Phase | Epochs | Active Losses | Purpose |
+|---|---|---|---|
+| **Phase 1** | `0 … phase1_epochs-1` | MSE only | Stable latent alignment; fast convergence |
+| **Phase 2** | `phase1_epochs … phase1_epochs+phase2_epochs-1` | MSE + Mel | Add perceptual audio-space supervision |
+| **Phase 3** | `phase1_epochs+phase2_epochs … end` | MSE + Mel + GAN | Adversarial refinement for audio realism |
+
+The script detects the current epoch and sets losses accordingly. Auto-resume from `latest_checkpoint.pth` picks up the correct phase automatically based on the saved epoch counter.
 
 ```bash
 python train_online.py \
@@ -83,9 +95,15 @@ python train_online.py \
   --hop_sec 0.5 \
   --window_sec 2.0 \
   --lambda_latent 1.0 \
-  --lambda_mel 0.1 \
+  --lambda_mel 12.0 \
+  --lambda_gan 0.5 \
+  --lambda_feat 1.0 \
+  --phase1_epochs 5 \
+  --phase2_epochs 5 \
   --gpu 0
 ```
+
+With this example: epochs 1–5 are MSE-only, epochs 6–10 add Mel loss, epochs 11–30 enable the full GAN.
 
 **Key arguments:**
 
@@ -95,57 +113,83 @@ python train_online.py \
 | `--dataset` | `kul` | Dataset format: `kul` or `cocktail` |
 | `--batch_size` | `64` | Training batch size |
 | `--lr` | `5e-4` | Initial learning rate |
-| `--epochs` | `15` | Number of training epochs |
+| `--epochs` | `15` | Total number of training epochs |
 | `--hop_sec` | `0.5` | Causal hop size in seconds |
 | `--window_sec` | `2.0` | Context window size in seconds |
 | `--lambda_latent` | `1.0` | Weight for latent MSE loss |
-| `--lambda_mel` | `0.1` | Weight for MelSpectrogram perceptual loss |
-| `--pretrained` | `""` | Path to checkpoint to resume from |
+| `--lambda_mel` | `12.0` | Weight for MelSpectrogram perceptual loss (Phases 2 & 3) |
+| `--lambda_gan` | `0.5` | Weight for GAN adversarial loss (Phase 3) |
+| `--lambda_feat` | `1.0` | Weight for GAN feature-matching loss (Phase 3) |
+| `--phase1_epochs` | `5` | Epochs to train with MSE loss only |
+| `--phase2_epochs` | `5` | Epochs to train with MSE + Mel before GAN activates |
+| `--disc_warmup_epochs` | `0` | Extra epochs at Phase-3 start to warm up discriminator before generator GAN loss |
+| `--pretrained` | `""` | Path to offline NeuroCodec checkpoint for warm-start |
 | `--checkpoint_dir` | `checkpoints/neurocodec_online` | Where to save checkpoints |
 | `--hidden_dim` | `256` | Mamba hidden dimension |
 | `--num_layers` | `4` | Number of Mamba layers |
 | `--eeg_channels` | `128` | Number of EEG channels |
 | `--debug` | flag | Run with a small subset for quick iteration |
 
-Checkpoints are saved to `--checkpoint_dir` as `best_model.pth` and `last_model.pth`.
+Checkpoints are saved after every epoch as `latest_checkpoint.pth` (full state) and `latest_model.pth` (weights only). The best validation-loss model is saved as `best_model.pth`.
 
 #### Training Loss
 
-The total loss per hop is:
-
+**Phase 1** (MSE only):
 ```
-L_total = lambda_latent * MSE(z_pred, z_target) + lambda_mel * MelSpec(decode(z_pred), clean_hop)
+L = lambda_latent × MSE(z_pred, z_target)
+```
+
+**Phase 2** (MSE + Mel):
+```
+L = lambda_latent × MSE(z_pred, z_target)
+  + lambda_mel    × MelSpec(decode(z_pred), clean_hop)
+```
+
+**Phase 3** (MSE + Mel + GAN):
+```
+L_G = lambda_latent × MSE(z_pred, z_target)
+    + lambda_mel    × MelSpec(decode(z_pred), clean_hop)
+    + lambda_gan    × Adv(decode(z_pred))
+    + lambda_feat   × FeatMatch(decode(z_pred), clean_hop)
+
+L_D = discriminator loss (updated every hop alongside L_G)
 ```
 
 - **MSE** on DAC latents: mathematical alignment in codec space.
 - **MelSpectrogram L1** (multi-scale, log-mel): perceptual supervision in audio space. Gradients backpropagate through the frozen DAC decoder into the trainable model without updating decoder weights.
-- Set `--lambda_mel 0.0` to disable MelSpec loss entirely and fall back to MSE-only (zero overhead — the decoder is not called).
+- **GAN adversarial + feature-matching**: uses the DAC multi-scale discriminator for audio realism. The discriminator is trained simultaneously with the generator.
 
 Memory note: the decoder forward graph for each hop is freed immediately via per-hop `.backward()`, keeping peak VRAM to one hop's graph regardless of sequence length.
 
 #### Resuming from a Checkpoint
 
+Training auto-resumes from `latest_checkpoint.pth` if it exists in `--checkpoint_dir` — just re-run the same command. The saved epoch counter determines which phase is active.
+
 ```bash
-python train_online.py --pretrained checkpoints/neurocodec_online/last_model.pth [... other args]
+# Just re-run the original command — auto-resume is automatic
+python train_online.py --root /path/to/dataset --epochs 30 --phase1_epochs 5 --phase2_epochs 5 ...
 ```
 
-> **Note on learning rate when resuming**: The optimizer state (including LR) is restored from the checkpoint. If you want to change the LR for a resumed run, patch the checkpoint before restarting:
+> **Note on learning rate when resuming**: The optimizer state (including LR) is restored from the checkpoint. To change the LR for a resumed run, patch the checkpoint:
 > ```python
 > import torch
-> ckpt = torch.load("checkpoints/neurocodec_online/last_model.pth", map_location="cpu")
-> for pg in ckpt['optimizer']['param_groups']:
+> ckpt = torch.load("checkpoints/neurocodec_online/latest_checkpoint.pth", map_location="cpu")
+> for pg in ckpt['optimizer_g']['param_groups']:
 >     pg['lr'] = 5e-4   # your new LR
-> ckpt['scheduler']['num_bad_epochs'] = 0
-> ckpt['scheduler']['best'] = ckpt['best_val_loss']
-> torch.save(ckpt, "checkpoints/neurocodec_online/last_model.pth")
+> ckpt['scheduler_g']['num_bad_epochs'] = 0
+> torch.save(ckpt, "checkpoints/neurocodec_online/latest_checkpoint.pth")
 > ```
 
 #### Training Output Format
 
 ```
-Epoch  21 | Train 0.0312 | Val 0.0289 | Cold 0.0301 | Steady 0.0271 | SI-SDR 8.43 dB (EEG-only 7.91 dB, gain +0.52 dB)
+Epoch   5 [Ph1:MSE]     | Train 0.0421 | Val 0.0389 | Cold 0.0401 | Steady 0.0371 | SI-SDR 7.12 dB (EEG-only 6.88 dB, gain +0.24 dB)
+Epoch   6 [Ph2:MSE+Mel] | Train 0.0318 | Val 0.0294 | Cold 0.0309 | Steady 0.0281 | SI-SDR 8.01 dB (EEG-only 7.55 dB, gain +0.46 dB)
+Epoch  11 [Ph3:GAN]     | Train 0.0312 | D 0.4821   | Val 0.0289 | Cold 0.0301 | Steady 0.0271 | SI-SDR 8.43 dB (EEG-only 7.91 dB, gain +0.52 dB)
 ```
 
+- **[Ph1/Ph2/Ph3]**: active training phase
+- **D**: discriminator loss (Phase 3 only)
 - **Cold**: validation loss on the first hop (no prior context)
 - **Steady**: validation loss on later hops (context accumulated)
 - **SI-SDR**: full-sequence SI-SDR with speaker encoder active
