@@ -378,9 +378,10 @@ def validate(
             eeg   = eeg.to(device)
 
             z_target_full, _ = model.encode_audio(clean)
-            T_dac_total  = z_target_full.shape[-1]
-            B            = noisy.shape[0]
-            eeg_channels = eeg.shape[1]
+            T_dac_total   = z_target_full.shape[-1]
+            B             = noisy.shape[0]
+            eeg_channels  = eeg.shape[1]
+            orig_audio_len = clean.shape[-1]   # save before padding for SI-SDR reference
 
             # Pad to exact hop multiples (same as training step)
             pad_audio = (-noisy.shape[-1]) % hop_samples
@@ -459,13 +460,17 @@ def validate(
 
             total_loss += batch_loss / num_hops
 
+            # ── SI-SDR: build a single clean reference (original, no padding) ─
+            # clean is padded at this point; slice back to original length so
+            # both SI-SDR passes use an identical, zero-free reference.
+            clean_np = clean[..., :orig_audio_len].cpu().numpy().squeeze(1)
+
             # ── SI-SDR: normal mode (speaker encoder ON for hops 1+) ───────
             z_pred_full = torch.cat(z_kept, dim=-1)[:, :, :T_dac_total]
             pred_audio  = model.decode_audio(z_pred_full)
-            min_len     = min(pred_audio.shape[-1], clean.shape[-1])
+            min_len     = min(pred_audio.shape[-1], orig_audio_len)
             pred_np     = pred_audio[..., :min_len].cpu().numpy().squeeze(1)
-            clean_np    = clean[..., :min_len].cpu().numpy().squeeze(1)
-            for ref, est in zip(clean_np, pred_np):
+            for ref, est in zip(clean_np[..., :min_len], pred_np):
                 sisdr_scores.append(align_and_sisdr(ref, est))
 
             # ── SI-SDR: EEG-only ablation (speaker encoder OFF for all hops) ─
@@ -491,9 +496,9 @@ def validate(
 
             z_pred_eeg  = torch.cat(z_kept_e, dim=-1)[:, :, :T_dac_total]
             pred_eeg    = model.decode_audio(z_pred_eeg)
-            min_len_e   = min(pred_eeg.shape[-1], clean.shape[-1])
+            min_len_e   = min(pred_eeg.shape[-1], orig_audio_len)
             pred_eeg_np = pred_eeg[..., :min_len_e].cpu().numpy().squeeze(1)
-            for ref, est in zip(clean_np, pred_eeg_np):
+            for ref, est in zip(clean_np[..., :min_len_e], pred_eeg_np):
                 sisdr_eeg_only.append(align_and_sisdr(ref, est))
 
             if args.debug and batch_idx > 2:
@@ -556,6 +561,7 @@ def train(args):
             lmdb_path=args.root, subset='train',
             batch_size=args.batch_size, num_gpus=1,
             target_fs=sr, original_fs=original_fs,
+            num_train_subjects=args.num_train_subjects,
         )
         val_loader = load_KUL_NeuroCodecDataset(
             lmdb_path=args.root, subset='val',
@@ -629,8 +635,14 @@ def train(args):
         print(f"Loading pretrained weights from {args.pretrained} ...")
         saved      = torch.load(args.pretrained, map_location=device)
         model_dict = model.state_dict()
-        matched    = {k: v for k, v in saved.items()
-                      if k in model_dict and model_dict[k].shape == v.shape}
+        matched    = {}
+        for k, v in saved.items():
+            if k not in model_dict:
+                print(f"  [SKIP] {k}  — not in current model")
+            elif model_dict[k].shape != v.shape:
+                print(f"  [SKIP] {k}  — shape mismatch: pretrained {tuple(v.shape)} vs model {tuple(model_dict[k].shape)}")
+            else:
+                matched[k] = v
         model_dict.update(matched)
         model.load_state_dict(model_dict)
         print(f"  Loaded {len(matched)}/{len(model_dict)} parameter tensors.")
@@ -681,11 +693,11 @@ def train(args):
             )
 
             if train_generator:
-                torch.nn.utils.clip_grad_norm_(trainable, max_norm=5.0)
+                torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
                 optimizer_g.step()
 
             if use_gan:
-                torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=5.0)
+                torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
                 optimizer_d.step()
 
             train_loss   += loss_val
@@ -768,7 +780,7 @@ def train(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Sliding-window training for OnlineNeuroCodec")
 
-    parser.add_argument("--root",           type=str,   default="/workspace/Dataset/kul_all_subjects.lmdb")
+    parser.add_argument("--root",           type=str,   default="/home/jaliya/chiposb/egaf/NeuroCodec/Dataset/kul_all_subjects.lmdb")
     parser.add_argument("--dataset",        type=str,   default="kul", choices=["cocktail", "kul"],
                         help="cocktail = Cocktail-Party HDF5 (128-ch EEG, 44.1 kHz); kul = KUL LMDB (64-ch EEG, 16 kHz)")
     parser.add_argument("--eeg_channels",   type=int,   default=128,
@@ -783,7 +795,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_layers",     type=int,   default=4)
     parser.add_argument("--dropout",        type=float, default=0.1,
                         help="Dropout rate in fusion blocks (default 0.1)")
-    parser.add_argument("--gpu",            type=int,   default=0)
+    parser.add_argument("--gpu",            type=int,   default=1)
     parser.add_argument("--hop_sec",        type=float, default=0.5,
                         help="Hop size in seconds (default 0.5 s)")
     parser.add_argument("--window_sec",     type=float, default=2.0,
@@ -793,12 +805,14 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_dir", type=str,   default="checkpoints/neurocodec_online")
     parser.add_argument("--lambda_latent",  type=float, default=1.0,
                         help="Weight for latent MSE loss (default 1.0)")
-    parser.add_argument("--lambda_mel",     type=float, default=0.1,
+    parser.add_argument("--lambda_mel",     type=float, default=12,
                         help="Weight for Mel perceptual loss (default 0.1)")
     parser.add_argument("--pretrained",     type=str,   default="",
                         help="Optional path to offline NeuroCodec checkpoint for warm-start")
     parser.add_argument("--debug",          action="store_true",
                         help="Run a fast debug pass (few batches per epoch)")
+    parser.add_argument("--num_train_subjects", type=int, default=None,
+                        help="Limit training to first N subjects (e.g. 7 for quick checks; default=None uses all)")
 
     # ── GAN hyperparameters ────────────────────────────────────────────────
     parser.add_argument("--lambda_gan",        type=float, default=0.5,

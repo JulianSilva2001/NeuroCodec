@@ -592,21 +592,21 @@ def evaluate_online(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Online sliding-window inference for OnlineNeuroCodec")
 
-    parser.add_argument("--root",         type=str,   default="/workspace/Dataset/kul_all_subjects.lmdb")
+    parser.add_argument("--root",         type=str,   default="/home/jaliya/chiposb/egaf/NeuroCodec/Dataset/kul_all_subjects.lmdb")
     parser.add_argument("--dataset",      type=str,   default="kul", choices=["cocktail", "kul"],
                         help="cocktail = Cocktail-Party HDF5; kul = KUL LMDB")
     parser.add_argument("--eeg_channels", type=int,   default=128,
                         help="EEG input channels (auto-set to 64 for KUL if left at default 128)")
     parser.add_argument("--eeg_sr",       type=int,   default=128,
                         help="EEG sample rate in Hz (default 128 for both datasets)")
-    parser.add_argument("--checkpoint",   type=str,   default="checkpoints/neurocodec_online/best_model.pth")
+    parser.add_argument("--checkpoint",   type=str,   default="checkpoints/neurocodec_online/latest_model.pth")
     parser.add_argument("--output_dir",   type=str,   default="outputs/online_inference")
-    parser.add_argument("--num_samples",  type=int,   default=10)
+    parser.add_argument("--num_samples",  type=int,   default=3000)
     parser.add_argument("--hop_sec",      type=float, default=0.5,
                         help="Sliding window hop size in seconds (default 0.5 s)")
     parser.add_argument("--hidden_dim",   type=int,   default=256)
     parser.add_argument("--num_layers",   type=int,   default=4)
-    parser.add_argument("--gpu",          type=int,   default=0)
+    parser.add_argument("--gpu",          type=int,   default=1)
     parser.add_argument("--plot",         action="store_true",
                         help="Save per-sample visualisation plots (PNG) to output_dir")
 

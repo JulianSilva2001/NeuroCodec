@@ -247,7 +247,7 @@ class KULNeuroCodecDataset(Dataset):
         
         return mix_resampled, eeg, clean_resampled
 
-def load_KUL_NeuroCodecDataset(lmdb_path, subset='train', batch_size=4, num_gpus=1, target_fs=44100, original_fs=16000, shuffle=None):
+def load_KUL_NeuroCodecDataset(lmdb_path, subset='train', batch_size=4, num_gpus=1, target_fs=44100, original_fs=16000, shuffle=None, num_train_subjects=None):
     """
     Loader for KUL Dataset (LMDB) with Subject-wise Splitting
     """
@@ -322,6 +322,8 @@ def load_KUL_NeuroCodecDataset(lmdb_path, subset='train', batch_size=4, num_gpus
         test_subj = [subjects[-2]] # S(N-1)
         val_subj = [subjects[-1]]  # S(N)
         train_subj = subjects[:-2]
+        if num_train_subjects is not None:
+            train_subj = train_subj[:num_train_subjects]
     else:
         # Fallback for small debug datasets
         print("Warning: Not enough subjects for split. Using random split.")
