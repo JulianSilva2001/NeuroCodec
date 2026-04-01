@@ -304,11 +304,13 @@ class OnlineInferenceEngine:
             output_hop = self.step(new_audio, new_eeg)
             output_hops.append(output_hop)
 
-        # Short crossfade at each hop junction to remove hard-cut clicks
-        # (10 ms linear fade-out on trailing edge, fade-in on leading edge)
-        fade_len = min(int(0.01 * self.sr), self.hop_samples // 4)
-        fade_out = torch.linspace(1.0, 0.0, fade_len, device=self.device)
-        fade_in  = torch.linspace(0.0, 1.0, fade_len, device=self.device)
+        # Equal-power crossfade at each hop junction.
+        # Uses cos/sin curves so fade_out² + fade_in² = 1.0 at every sample —
+        # energy stays constant across the junction (no audible dip/creak).
+        fade_len = min(int(0.02 * self.sr), self.hop_samples // 4)
+        t        = torch.linspace(0.0, torch.pi / 2, fade_len, device=self.device)
+        fade_out = torch.cos(t)   # 1 → 0, curved
+        fade_in  = torch.sin(t)   # 0 → 1, curved
         for i in range(1, len(output_hops)):
             output_hops[i - 1][0, 0, -fade_len:] *= fade_out
             output_hops[i    ][0, 0, :fade_len]   *= fade_in

@@ -668,14 +668,17 @@ def train(args):
             current_phase        = 1
             effective_lambda_mel = 0.0
             use_gan              = False
-        elif epoch < phase3_start:
-            current_phase        = 2
-            effective_lambda_mel = args.lambda_mel
-            use_gan              = False
         else:
-            current_phase        = 3
-            effective_lambda_mel = args.lambda_mel
-            use_gan              = True
+            # Ramp lambda_mel linearly from lambda_mel_start → lambda_mel
+            # over mel_ramp_epochs epochs starting from phase2_start.
+            mel_progress         = min((epoch - phase2_start) / max(args.mel_ramp_epochs - 1, 1), 1.0)
+            effective_lambda_mel = args.lambda_mel_start + mel_progress * (args.lambda_mel - args.lambda_mel_start)
+            if epoch < phase3_start:
+                current_phase = 2
+                use_gan       = False
+            else:
+                current_phase = 3
+                use_gan       = True
 
         train_generator = not use_gan or epoch >= (phase3_start + args.disc_warmup_epochs)
 
@@ -826,8 +829,12 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_dir", type=str,   default="checkpoints/neurocodec_online")
     parser.add_argument("--lambda_latent",  type=float, default=1.0,
                         help="Weight for latent MSE loss (default 1.0)")
-    parser.add_argument("--lambda_mel",     type=float, default=12,
-                        help="Weight for Mel perceptual loss (default 0.1)")
+    parser.add_argument("--lambda_mel",       type=float, default=10.0,
+                        help="Final Mel loss weight at end of ramp (default 10.0)")
+    parser.add_argument("--lambda_mel_start", type=float, default=0.1,
+                        help="Starting Mel loss weight at phase2_start (default 0.1)")
+    parser.add_argument("--mel_ramp_epochs",  type=int,   default=15,
+                        help="Number of epochs to ramp lambda_mel from start to final (default 15)")
     parser.add_argument("--pretrained",     type=str,   default="",
                         help="Optional path to offline NeuroCodec checkpoint for warm-start")
     parser.add_argument("--debug",          action="store_true",
