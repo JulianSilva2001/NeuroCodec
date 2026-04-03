@@ -277,7 +277,13 @@ def sliding_window_train_step(
         hop_loss = lambda_latent * mse_loss_h
 
         if lambda_mel > 0.0 or use_gan:
-            y_hat     = model.dac.decode(z_pred_last)      # (B, 1, T_decoded)
+            if train_generator:
+                y_hat = model.dac.decode(z_pred_last)
+            else:
+                # D warmup: no generator gradients needed — skip graph construction
+                # entirely to prevent DAC decoder graphs accumulating across hops (OOM).
+                with torch.no_grad():
+                    y_hat = model.dac.decode(z_pred_last.detach())
             clean_hop = clean[:, :, a0:a1]                 # (B, 1, hop_samples)
             # Trim to same length (DAC stride may add a few extra samples)
             min_len   = min(y_hat.shape[-1], clean_hop.shape[-1])
@@ -288,16 +294,29 @@ def sliding_window_train_step(
                 hop_loss = hop_loss + lambda_mel * mel_criterion(y_hat, clean_hop)
 
             if use_gan:
-                # ── Discriminator step (accumulate D grads across hops) ──────
-                # y_hat is detached so D's backward does NOT touch G's graph.
-                d_loss_h = gan_loss_fn.discriminator_loss(y_hat.detach(), clean_hop)
+                # ── GAN on full 2s window — gives discriminator enough context ──
+                # Decode the full z_pred_h (2s) instead of just the 0.5s hop.
+                # D sees complete speech segments → better quality judgement.
+                # The corresponding clean reference is the full audio buffer window.
+                win_start = max(0, a1 - window_samples)
+                clean_win = clean[:, :, win_start:a1]          # (B, 1, window_samples)
+                if train_generator:
+                    y_hat_win = model.dac.decode(z_pred_h)
+                else:
+                    with torch.no_grad():
+                        y_hat_win = model.dac.decode(z_pred_h.detach())
+                min_win = min(y_hat_win.shape[-1], clean_win.shape[-1])
+                y_hat_win = y_hat_win[..., :min_win]
+                clean_win = clean_win[..., :min_win]
+
+                # ── Discriminator step ──────────────────────────────────────
+                d_loss_h = gan_loss_fn.discriminator_loss(y_hat_win.detach(), clean_win)
                 (d_loss_h / num_hops).backward()
                 total_d_loss += d_loss_h.item()
 
                 if train_generator:
                     # ── Generator adversarial + feature-matching losses ──────
-                    # y_hat is NOT detached: gradients flow back into z_pred_last.
-                    g_adv, g_feat = gan_loss_fn.generator_loss(y_hat, clean_hop)
+                    g_adv, g_feat = gan_loss_fn.generator_loss(y_hat_win, clean_win)
                     hop_loss = hop_loss + lambda_gan * g_adv + lambda_feat * g_feat
 
         # ── Per-hop backward — frees this hop's graph immediately ──────────
