@@ -294,17 +294,19 @@ def sliding_window_train_step(
                 hop_loss = hop_loss + lambda_mel * mel_criterion(y_hat, clean_hop)
 
             if use_gan:
-                # ── GAN on full 2s window — gives discriminator enough context ──
-                # Decode the full z_pred_h (2s) instead of just the 0.5s hop.
-                # D sees complete speech segments → better quality judgement.
-                # The corresponding clean reference is the full audio buffer window.
-                win_start = max(0, a1 - window_samples)
-                clean_win = clean[:, :, win_start:a1]          # (B, 1, window_samples)
+                # ── GAN on 1s window — 2x more context than 0.5s hop but half
+                # the memory of the full 2s window (feature matching OOM with 2s).
+                gan_win = window_samples // 2                  # 1s
+                win_start = max(0, a1 - gan_win)
+                clean_win = clean[:, :, win_start:a1]          # (B, 1, gan_win)
+                # Take the last half of z_pred_h (matches the 1s clean_win)
+                gan_dac = z_pred_h.shape[-1] // 2
+                z_pred_gan = z_pred_h[:, :, -gan_dac:]
                 if train_generator:
-                    y_hat_win = model.dac.decode(z_pred_h)
+                    y_hat_win = model.dac.decode(z_pred_gan)
                 else:
                     with torch.no_grad():
-                        y_hat_win = model.dac.decode(z_pred_h.detach())
+                        y_hat_win = model.dac.decode(z_pred_gan.detach())
                 min_win = min(y_hat_win.shape[-1], clean_win.shape[-1])
                 y_hat_win = y_hat_win[..., :min_win]
                 clean_win = clean_win[..., :min_win]
