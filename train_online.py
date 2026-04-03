@@ -294,31 +294,16 @@ def sliding_window_train_step(
                 hop_loss = hop_loss + lambda_mel * mel_criterion(y_hat, clean_hop)
 
             if use_gan:
-                # ── GAN on 1s window — 2x more context than 0.5s hop but half
-                # the memory of the full 2s window (feature matching OOM with 2s).
-                gan_win = window_samples // 2                  # 1s
-                win_start = max(0, a1 - gan_win)
-                clean_win = clean[:, :, win_start:a1]          # (B, 1, gan_win)
-                # Take the last half of z_pred_h (matches the 1s clean_win)
-                gan_dac = z_pred_h.shape[-1] // 2
-                z_pred_gan = z_pred_h[:, :, -gan_dac:]
-                if train_generator:
-                    y_hat_win = model.dac.decode(z_pred_gan)
-                else:
-                    with torch.no_grad():
-                        y_hat_win = model.dac.decode(z_pred_gan.detach())
-                min_win = min(y_hat_win.shape[-1], clean_win.shape[-1])
-                y_hat_win = y_hat_win[..., :min_win]
-                clean_win = clean_win[..., :min_win]
-
-                # ── Discriminator step ──────────────────────────────────────
-                d_loss_h = gan_loss_fn.discriminator_loss(y_hat_win.detach(), clean_win)
+                # ── Discriminator step (accumulate D grads across hops) ──────
+                # y_hat is detached so D's backward does NOT touch G's graph.
+                d_loss_h = gan_loss_fn.discriminator_loss(y_hat.detach(), clean_hop)
                 (d_loss_h / num_hops).backward()
                 total_d_loss += d_loss_h.item()
 
                 if train_generator:
                     # ── Generator adversarial + feature-matching losses ──────
-                    g_adv, g_feat = gan_loss_fn.generator_loss(y_hat_win, clean_win)
+                    # y_hat is NOT detached: gradients flow back into z_pred_last.
+                    g_adv, g_feat = gan_loss_fn.generator_loss(y_hat, clean_hop)
                     hop_loss = hop_loss + lambda_gan * g_adv + lambda_feat * g_feat
 
         # ── Per-hop backward — frees this hop's graph immediately ──────────
