@@ -38,6 +38,133 @@ def configure_determinism():
         print(f"Warning: could not enable deterministic algorithms: {exc}")
 
 
+def set_optimizer_lr(optimizer, lr):
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+
+
+def get_phase2_epochs(args):
+    ramp_epochs = max(0, args.phase2_lambda_mel_end - args.phase2_lambda_mel_start + 1)
+    return ramp_epochs + args.phase2_hold_epochs
+
+
+def get_training_phase(epoch, args):
+    phase1_end = args.phase1_epochs
+    phase2_ramp_epochs = max(0, args.phase2_lambda_mel_end - args.phase2_lambda_mel_start + 1)
+    phase2_epochs = get_phase2_epochs(args)
+    phase2_end = phase1_end + phase2_epochs
+    phase3_end = phase2_end + args.phase3_epochs
+
+    if epoch < phase1_end:
+        return {
+            "name": "phase1_mse",
+            "display_name": "Phase 1 MSE",
+            "loss_mode": "mse",
+            "lambda_mel": 0.0,
+            "use_gan": False,
+            "train_generator": True,
+            "scheduler_active": False,
+            "lr_g": args.phase1_lr,
+            "lr_d": args.lr,
+            "train_batch_size": args.phase1_batch_size,
+        }
+
+    if epoch < phase2_end:
+        phase2_offset = epoch - phase1_end
+        if phase2_offset < phase2_ramp_epochs:
+            lambda_mel = min(
+                args.phase2_lambda_mel_start + phase2_offset,
+                args.phase2_lambda_mel_end,
+            )
+            phase2_name = "phase2_mel_ramp"
+            phase2_display_name = "Phase 2 Mel Ramp"
+        else:
+            lambda_mel = args.phase2_lambda_mel_end
+            phase2_name = "phase2_mel_hold"
+            phase2_display_name = "Phase 2 Mel Hold"
+        return {
+            "name": phase2_name,
+            "display_name": phase2_display_name,
+            "loss_mode": "full",
+            "lambda_mel": float(lambda_mel),
+            "use_gan": False,
+            "train_generator": True,
+            "scheduler_active": False,
+            "lr_g": args.lr,
+            "lr_d": args.lr,
+            "train_batch_size": args.phase2_batch_size,
+        }
+
+    if epoch < phase3_end:
+        return {
+            "name": "phase3_gan_warmup",
+            "display_name": "Phase 3 GAN Warmup",
+            "loss_mode": "full",
+            "lambda_mel": float(args.phase2_lambda_mel_end),
+            "use_gan": True,
+            "train_generator": False,
+            "scheduler_active": False,
+            "lr_g": args.phase3_lr,
+            "lr_d": args.phase3_lr,
+            "train_batch_size": args.phase3_batch_size,
+        }
+
+    return {
+        "name": "phase4_full",
+        "display_name": "Phase 4 Full Training",
+        "loss_mode": "full",
+        "lambda_mel": float(args.phase2_lambda_mel_end),
+        "use_gan": True,
+        "train_generator": True,
+        "scheduler_active": True,
+        "lr_g": args.phase4_lr,
+        "lr_d": args.phase4_lr,
+        "train_batch_size": args.batch_size,
+    }
+
+
+def build_loaders(args, target_fs, train_batch_size=None, val_batch_size=None):
+    if train_batch_size is None:
+        train_batch_size = args.batch_size
+    if val_batch_size is None:
+        val_batch_size = args.batch_size
+
+    if args.dataset == 'cocktail':
+        train_loader = load_NeuroCodecDataset(
+            root=args.root,
+            subset='train',
+            batch_size=train_batch_size,
+            num_gpus=1
+        )
+        val_loader = load_NeuroCodecDataset(
+            root=args.root,
+            subset='val',
+            batch_size=val_batch_size,
+            num_gpus=1
+        )
+    elif args.dataset == 'kul':
+        train_loader = load_KUL_NeuroCodecDataset(
+            lmdb_path=args.root,
+            subset='train',
+            batch_size=train_batch_size,
+            num_gpus=1,
+            target_fs=target_fs,
+            original_fs=16000
+        )
+        val_loader = load_KUL_NeuroCodecDataset(
+            lmdb_path=args.root,
+            subset='val',
+            batch_size=val_batch_size,
+            num_gpus=1,
+            target_fs=target_fs,
+            original_fs=16000
+        )
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
+
+    return train_loader, val_loader
+
+
 def build_checkpoint(model, discriminator, optimizer_g, optimizer_d, scheduler_g, scheduler_d, epoch, best_val_loss):
     checkpoint = {
         "epoch": epoch,
@@ -163,38 +290,7 @@ def train(args):
         dac_model_type = '44khz'
         target_fs = 44100
 
-    if args.dataset == 'cocktail':
-         train_loader = load_NeuroCodecDataset(
-            root=args.root, 
-            subset='train', 
-            batch_size=args.batch_size,
-            num_gpus=1
-        )
-         val_loader = load_NeuroCodecDataset(
-            root=args.root, 
-            subset='val', 
-            batch_size=args.batch_size, 
-            num_gpus=1
-        )
-    elif args.dataset == 'kul':
-         train_loader = load_KUL_NeuroCodecDataset(
-            lmdb_path=args.root, # Root should be LMDB path for KUL
-            subset='train',
-            batch_size=args.batch_size,
-            num_gpus=1,
-            target_fs=target_fs,
-            original_fs=16000 # Correct FS
-         )
-         val_loader = load_KUL_NeuroCodecDataset(
-            lmdb_path=args.root,
-            subset='val',
-            batch_size=args.batch_size,
-            num_gpus=1,
-            target_fs=target_fs,
-            original_fs=16000 # Correct FS
-         )
-    else:
-        raise ValueError(f"Unknown dataset: {args.dataset}")
+    train_loader, val_loader = build_loaders(args, target_fs)
 
     model = NeuroCodec(
         dac_model_type=dac_model_type,
@@ -268,20 +364,62 @@ def train(args):
             print(f"Failed to load checkpoint: {e}. Starting from scratch.")
     else:
         print("No existing checkpoint found. Starting from scratch.")
+
+    phase2_epochs = get_phase2_epochs(args)
+    min_full_training_epoch = args.phase1_epochs + phase2_epochs + args.phase3_epochs + 1
+    print(
+        "Training schedule | "
+        f"Phase 1: MSE-only for {args.phase1_epochs} epochs @ lr={args.phase1_lr:.1e} | "
+        f"Phase 2: mel ramp/hold for {phase2_epochs} epochs "
+        f"(lambda_mel {args.phase2_lambda_mel_start}->{args.phase2_lambda_mel_end}, "
+        f"hold {args.phase2_hold_epochs} epochs) | "
+        f"Phase 3: GAN warmup for {args.phase3_epochs} epochs @ lr={args.phase3_lr:.1e} | "
+        f"Phase 4: full training @ lr={args.phase4_lr:.1e} with LR scheduler"
+    )
+    print(
+        f"Batch schedule | Phase 1 train batch size: {args.phase1_batch_size} | "
+        f"Phase 2 train batch size: {args.phase2_batch_size} | "
+        f"Phase 3 train batch size: {args.phase3_batch_size} | "
+        f"Phase 4 train batch size: {args.batch_size} | "
+        f"Validation batch size: {args.batch_size}"
+    )
+    if args.epochs < min_full_training_epoch:
+        print(
+            f"Warning: epochs={args.epochs} only covers phases 1-3/early transition. "
+            f"Use at least {min_full_training_epoch} epochs to enter Phase 4."
+        )
     
+    active_train_batch_size = None
     for epoch in range(start_epoch, args.epochs):
         model.train()
         discriminator.train()
         total_loss = 0
         total_g_loss = 0
         total_d_loss = 0
-        
-        # Determine when to start GAN training
-        use_gan = epoch >= args.gan_start_epoch
-        
+
+        phase_cfg = get_training_phase(epoch, args)
+        use_gan = phase_cfg["use_gan"]
+        train_generator_epoch = phase_cfg["train_generator"]
+        loss_mode = phase_cfg["loss_mode"]
+        lambda_mel = phase_cfg["lambda_mel"]
+        train_batch_size = phase_cfg["train_batch_size"]
+        set_optimizer_lr(optimizer_g, phase_cfg["lr_g"])
+        set_optimizer_lr(optimizer_d, phase_cfg["lr_d"])
+
+        if active_train_batch_size != train_batch_size:
+            train_loader, _ = build_loaders(args, target_fs, train_batch_size=train_batch_size, val_batch_size=args.batch_size)
+            active_train_batch_size = train_batch_size
+            print(f"Epoch {epoch+1}: rebuilding train loader with batch size {train_batch_size}")
+
         current_lr_g = optimizer_g.param_groups[0]['lr']
         current_lr_d = optimizer_d.param_groups[0]['lr']
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [LR_G: {current_lr_g:.1e}, LR_D: {current_lr_d:.1e}]")
+        pbar = tqdm(
+            train_loader,
+            desc=(
+                f"Epoch {epoch+1}/{args.epochs} | {phase_cfg['display_name']} "
+                f"[BS: {train_batch_size}, LR_G: {current_lr_g:.1e}, LR_D: {current_lr_d:.1e}, MEL: {lambda_mel:.1f}]"
+            )
+        )
         
         for batch_idx, (noisy, eeg, clean) in enumerate(pbar):
             noisy = noisy.to(device)
@@ -303,12 +441,14 @@ def train(args):
             z_pred, _, _, _, _ = model(noisy, eeg)
             
             # --- MSE-only mode: skip decoder entirely ---
-            if args.loss == 'mse':
+            if loss_mode == 'mse':
                 train_generator = True
                 use_gan = False
                 optimizer_g.zero_grad()
                 recon_loss, loss_dict = criterion(z_pred, z_target)
                 loss_dict['loss_mel'] = 0.0
+                loss_dict['loss_adv'] = 0.0
+                loss_dict['loss_feat'] = 0.0
                 recon_loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer_g.step()
@@ -339,7 +479,7 @@ def train(args):
                     d_loss = torch.tensor(0.0)
 
                 # --- Generator Step ---
-                train_generator = epoch >= args.disc_warmup_epochs
+                train_generator = train_generator_epoch
                 
                 optimizer_g.zero_grad()
                 
@@ -348,9 +488,9 @@ def train(args):
                     recon_loss, loss_dict = criterion(z_pred, z_target)
                     
                     # 2. Mel Spectrogram Loss
-                    if epoch >= args.mel_start_epoch:
+                    if lambda_mel > 0:
                         mel_loss = mel_loss_fn(pred_audio, clean_aligned)
-                        recon_loss += args.lambda_mel * mel_loss
+                        recon_loss += lambda_mel * mel_loss
                         loss_dict['loss_mel'] = mel_loss.item()
                     else:
                         loss_dict['loss_mel'] = 0.0
@@ -380,11 +520,15 @@ def train(args):
                             g_loss_adv, g_loss_feat = gan_loss_fn.generator_loss(pred_audio, clean_aligned)
                             loss_dict['loss_adv'] = g_loss_adv.item()
                             loss_dict['loss_feat'] = g_loss_feat.item()
+                         else:
+                            loss_dict['loss_adv'] = 0.0
+                            loss_dict['loss_feat'] = 0.0
             
             # Logging
             postfix = {
                 'loss': f"{log_recon_loss:.4f}", 
                 'mse': f"{loss_dict['loss_recon']:.4f}",
+                'phase': phase_cfg['name'],
             }
             if not train_generator:
                 postfix['WARMUP'] = "D_ONLY"
@@ -410,10 +554,16 @@ def train(args):
             val_loss, val_sisdr, val_estoi = validate(model, val_loader, criterion, device, args)
             
             # Step Schedulers
-            scheduler_g.step(val_loss)
-            scheduler_d.step(val_loss)
+            if phase_cfg["scheduler_active"]:
+                scheduler_g.step(val_loss)
+                scheduler_d.step(val_loss)
             
-            print(f"Epoch {epoch+1} | Train Loss: {total_loss/len(train_loader):.4f} | Val Loss: {val_loss:.4f} | Val SI-SDR: {val_sisdr:.2f} dB | Val ESTOI: {val_estoi:.4f}")
+            print(
+                f"Epoch {epoch+1} | {phase_cfg['display_name']} | "
+                f"Train Loss: {total_loss/len(train_loader):.4f} | "
+                f"Val Loss: {val_loss:.4f} | Val SI-SDR: {val_sisdr:.2f} dB | "
+                f"Val ESTOI: {val_estoi:.4f} | lambda_mel: {lambda_mel:.1f}"
+            )
             
 
             
@@ -436,7 +586,11 @@ def train(args):
                 print("Saved Best Model.")
 
         else:
-            print(f"Epoch {epoch+1} | Train Loss: {total_loss/len(train_loader):.4f} | Validation Skipped")
+            print(
+                f"Epoch {epoch+1} | {phase_cfg['display_name']} | "
+                f"Train Loss: {total_loss/len(train_loader):.4f} | "
+                f"Validation Skipped | lambda_mel: {lambda_mel:.1f}"
+            )
 
         
         # Save Latest Checkpoint (Every Epoch)
@@ -598,6 +752,17 @@ if __name__ == "__main__":
     parser.add_argument('--val_batches', type=int, default=0, help="Limit number of validation batches (0 = full)")
     parser.add_argument('--estoi', action='store_true', help="Compute ESTOI during validation (slow, disabled by default)")
     parser.add_argument('--seed', type=int, default=42, help='Global random seed for reproducible training and evaluation')
+    parser.add_argument('--phase1_epochs', type=int, default=8, help='Phase 1 duration: latent MSE-only training epochs')
+    parser.add_argument('--phase1_lr', type=float, default=1e-4, help='Phase 1 generator learning rate')
+    parser.add_argument('--phase1_batch_size', type=int, default=64, help='Phase 1 training batch size')
+    parser.add_argument('--phase2_lambda_mel_start', type=int, default=2, help='Starting lambda_mel value for phase 2 ramp')
+    parser.add_argument('--phase2_lambda_mel_end', type=int, default=15, help='Final lambda_mel value for phase 2 ramp and later phases')
+    parser.add_argument('--phase2_hold_epochs', type=int, default=5, help='Extra phase 2 epochs to keep lambda_mel fixed at the final value')
+    parser.add_argument('--phase2_batch_size', type=int, default=16, help='Phase 2 training batch size')
+    parser.add_argument('--phase3_epochs', type=int, default=3, help='Phase 3 duration: discriminator warmup epochs')
+    parser.add_argument('--phase3_batch_size', type=int, default=8, help='Phase 3 training batch size')
+    parser.add_argument('--phase3_lr', type=float, default=1e-5, help='Phase 3 learning rate')
+    parser.add_argument('--phase4_lr', type=float, default=1e-5, help='Phase 4 initial learning rate before scheduler updates')
     
     parser.add_argument('--lambda_gan', type=float, default=1, help="Weight for GAN Adversarial Loss")
     parser.add_argument('--lambda_feat', type=float, default=2, help="Weight for GAN Feature Matching Loss")
