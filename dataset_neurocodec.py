@@ -1,8 +1,15 @@
 import torch
 import h5py, os
+import random
 from torch.utils.data import Dataset
 import numpy as np
 from torch.utils.data.distributed import DistributedSampler
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 class NeuroCodecDataset(Dataset):
     def __init__(self, root, mode, subject=None, return_subject=False, return_index=False):
@@ -193,7 +200,8 @@ def load_NeuroCodecDataset(root, subset='train', batch_size=4, num_gpus=1, shuff
         shuffle=shuffle, # Use the determined variable
         num_workers=12,
         sampler=sampler,
-        pin_memory=True
+        pin_memory=True,
+        worker_init_fn=seed_worker
     )
     return loader
 
@@ -424,6 +432,7 @@ def load_KUL_NeuroCodecDataset(lmdb_path, subset='train', batch_size=4, num_gpus
         shuffle=shuffle,
         num_workers=12,
         sampler=sampler,
-        pin_memory=True
+        pin_memory=True,
+        worker_init_fn=seed_worker
     )
     return loader

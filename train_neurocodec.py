@@ -1,6 +1,7 @@
 
 import os
 import argparse
+import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -16,6 +17,92 @@ from dataset_neurocodec import load_NeuroCodecDataset, load_KUL_NeuroCodecDatase
 # Consolidated and updated imports from 'losses' and 'losses_neurocodec'
 from losses import MelSpectrogramLoss, GANLoss # Added GANLoss
 from losses_neurocodec import NeuroCodecLoss # Kept this as it was in the original code
+
+
+def set_global_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+def configure_determinism():
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception as exc:
+        print(f"Warning: could not enable deterministic algorithms: {exc}")
+
+
+def build_checkpoint(model, discriminator, optimizer_g, optimizer_d, scheduler_g, scheduler_d, epoch, best_val_loss):
+    checkpoint = {
+        "epoch": epoch,
+        "best_val_loss": best_val_loss,
+        "model_state_dict": model.state_dict(),
+        "discriminator_state_dict": discriminator.state_dict(),
+        "optimizer_g_state_dict": optimizer_g.state_dict(),
+        "optimizer_d_state_dict": optimizer_d.state_dict(),
+        "scheduler_g_state_dict": scheduler_g.state_dict(),
+        "scheduler_d_state_dict": scheduler_d.state_dict(),
+        "torch_rng_state": torch.get_rng_state(),
+        "numpy_rng_state": np.random.get_state(),
+        "python_rng_state": random.getstate(),
+    }
+    if torch.cuda.is_available():
+        checkpoint["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+    return checkpoint
+
+
+def restore_checkpoint(checkpoint, model, discriminator, optimizer_g, optimizer_d, scheduler_g, scheduler_d):
+    start_epoch = 0
+    best_val_loss = float("inf")
+
+    if not isinstance(checkpoint, dict):
+        model.load_state_dict(checkpoint, strict=False)
+        return start_epoch, best_val_loss
+
+    if "model_state_dict" in checkpoint:
+        model_state = checkpoint["model_state_dict"]
+    elif "state_dict" in checkpoint:
+        model_state = checkpoint["state_dict"]
+    elif "model" in checkpoint:
+        model_state = checkpoint["model"]
+    else:
+        model_state = checkpoint
+
+    incompatible = model.load_state_dict(model_state, strict=False)
+    if incompatible.missing_keys:
+        print(f"Warning: Missing keys ({len(incompatible.missing_keys)}).")
+    if incompatible.unexpected_keys:
+        print(f"Warning: Unexpected keys ({len(incompatible.unexpected_keys)}): {incompatible.unexpected_keys}")
+
+    if "discriminator_state_dict" in checkpoint:
+        discriminator.load_state_dict(checkpoint["discriminator_state_dict"])
+    if "optimizer_g_state_dict" in checkpoint:
+        optimizer_g.load_state_dict(checkpoint["optimizer_g_state_dict"])
+    if "optimizer_d_state_dict" in checkpoint:
+        optimizer_d.load_state_dict(checkpoint["optimizer_d_state_dict"])
+    if "scheduler_g_state_dict" in checkpoint:
+        scheduler_g.load_state_dict(checkpoint["scheduler_g_state_dict"])
+    if "scheduler_d_state_dict" in checkpoint:
+        scheduler_d.load_state_dict(checkpoint["scheduler_d_state_dict"])
+
+    if "torch_rng_state" in checkpoint:
+        torch.set_rng_state(checkpoint["torch_rng_state"])
+    if "numpy_rng_state" in checkpoint:
+        np.random.set_state(checkpoint["numpy_rng_state"])
+    if "python_rng_state" in checkpoint:
+        random.setstate(checkpoint["python_rng_state"])
+    if torch.cuda.is_available() and "cuda_rng_state_all" in checkpoint:
+        torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state_all"])
+
+    start_epoch = checkpoint.get("epoch", -1) + 1
+    best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+    return start_epoch, best_val_loss
 
 def sisdr(reference, estimation):
     """
@@ -118,42 +205,6 @@ def train(args):
         activation=args.activation,
         dropout=args.dropout
     ).to(device)
-    
-
-    
-    # 3.1 Load Checkpoint if Exists (Resume Training)
-    latest_checkpoint = os.path.join(args.checkpoint_dir, "latest_model.pth")
-    if os.path.exists(latest_checkpoint):
-        print(f"Resuming from checkpoint: {latest_checkpoint}")
-        try:
-             checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=True)
-             if isinstance(checkpoint, dict):
-                 if "state_dict" in checkpoint:
-                     state_dict = checkpoint["state_dict"]
-                 elif "model_state_dict" in checkpoint:
-                     state_dict = checkpoint["model_state_dict"]
-                 elif "model" in checkpoint:
-                     state_dict = checkpoint["model"]
-                 else:
-                     state_dict = checkpoint
-             else:
-                 state_dict = checkpoint
-             
-             # Allow loading older checkpoints with now-removed keys (e.g., envelope head)
-             incompatible = model.load_state_dict(state_dict, strict=False)
-             if incompatible.missing_keys:
-                 print(f"Warning: Missing keys ({len(incompatible.missing_keys)}).")
-             if incompatible.unexpected_keys:
-                 print(f"Warning: Unexpected keys ({len(incompatible.unexpected_keys)}): {incompatible.unexpected_keys}")
-             print("Checkpoint loaded (strict=False).")
-        except Exception as e:
-             print(f"Failed to load checkpoint: {e}. Starting from scratch.")
-    else:
-        print("No existing checkpoint found. Starting from scratch.")
-    
-    # 4. Optimizer
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-2) 
-    
     criterion = NeuroCodecLoss(lambda_recon=1.0).to(device)
     # Use paper full multi-scale mel schedule for Cocktail (44.1kHz).
     if args.dataset == 'cocktail':
@@ -194,9 +245,31 @@ def train(args):
     )
     
     # 5. Training Loop
+    start_epoch = 0
     best_val_loss = float('inf')
+
+    # 5.1 Load Checkpoint if Exists (Resume Training)
+    latest_checkpoint = os.path.join(args.checkpoint_dir, "latest_model.pth")
+    if os.path.exists(latest_checkpoint):
+        print(f"Resuming from checkpoint: {latest_checkpoint}")
+        try:
+            checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=False)
+            start_epoch, best_val_loss = restore_checkpoint(
+                checkpoint,
+                model,
+                discriminator,
+                optimizer_g,
+                optimizer_d,
+                scheduler_g,
+                scheduler_d,
+            )
+            print(f"Checkpoint loaded. Resuming at epoch {start_epoch + 1}.")
+        except Exception as e:
+            print(f"Failed to load checkpoint: {e}. Starting from scratch.")
+    else:
+        print("No existing checkpoint found. Starting from scratch.")
     
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         discriminator.train()
         total_loss = 0
@@ -347,7 +420,19 @@ def train(args):
             # Save Checkpoint (Best)
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                torch.save(model.state_dict(), os.path.join(args.checkpoint_dir, "best_model.pth"))
+                torch.save(
+                    build_checkpoint(
+                        model,
+                        discriminator,
+                        optimizer_g,
+                        optimizer_d,
+                        scheduler_g,
+                        scheduler_d,
+                        epoch,
+                        best_val_loss,
+                    ),
+                    os.path.join(args.checkpoint_dir, "best_model.pth")
+                )
                 print("Saved Best Model.")
 
         else:
@@ -355,7 +440,19 @@ def train(args):
 
         
         # Save Latest Checkpoint (Every Epoch)
-        torch.save(model.state_dict(), os.path.join(args.checkpoint_dir, "latest_model.pth"))
+        torch.save(
+            build_checkpoint(
+                model,
+                discriminator,
+                optimizer_g,
+                optimizer_d,
+                scheduler_g,
+                scheduler_d,
+                epoch,
+                best_val_loss,
+            ),
+            os.path.join(args.checkpoint_dir, "latest_model.pth")
+        )
 
 def validate(model, loader, criterion, device, args):
     model.eval()
@@ -500,6 +597,7 @@ if __name__ == "__main__":
     parser.add_argument('--mel_start_epoch', type=int, default=0, help="Epoch to start applying Mel Loss")
     parser.add_argument('--val_batches', type=int, default=0, help="Limit number of validation batches (0 = full)")
     parser.add_argument('--estoi', action='store_true', help="Compute ESTOI during validation (slow, disabled by default)")
+    parser.add_argument('--seed', type=int, default=42, help='Global random seed for reproducible training and evaluation')
     
     parser.add_argument('--lambda_gan', type=float, default=1, help="Weight for GAN Adversarial Loss")
     parser.add_argument('--lambda_feat', type=float, default=2, help="Weight for GAN Feature Matching Loss")
@@ -509,8 +607,9 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    # Set seed
-    torch.manual_seed(42)
+    # Set seed / deterministic behavior
+    set_global_seed(args.seed)
+    configure_determinism()
     
     if args.evaluate:
         # Evaluate Only Mode
@@ -556,8 +655,19 @@ if __name__ == "__main__":
         
         if os.path.exists(checkpoint_path):
             print(f"Loading checkpoint {checkpoint_path}...")
-            # Use weights_only=False to avoid future warnings if safe, or handle pickle security
-            model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+            if isinstance(checkpoint, dict):
+                if "model_state_dict" in checkpoint:
+                    state_dict = checkpoint["model_state_dict"]
+                elif "state_dict" in checkpoint:
+                    state_dict = checkpoint["state_dict"]
+                elif "model" in checkpoint:
+                    state_dict = checkpoint["model"]
+                else:
+                    state_dict = checkpoint
+            else:
+                state_dict = checkpoint
+            model.load_state_dict(state_dict, strict=False)
         else:
             print(f"No checkpoint found at {checkpoint_path}! Running with random weights.")
             
