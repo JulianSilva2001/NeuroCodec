@@ -728,7 +728,7 @@ def validate(model, loader, criterion, device, args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root', type=str, default='/workspace/NeuroCodec/CocktailParty/2s')
+    parser.add_argument('--root', type=str, default='/home/avishka/isuranga/TSE/data/')
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--epochs', type=int, default=50)
