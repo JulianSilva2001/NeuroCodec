@@ -728,14 +728,14 @@ def validate(model, loader, criterion, device, args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root', type=str, default='/home/avishka/isuranga/TSE/data/')
+    parser.add_argument('--root', type=str, default='/home/avishka/isuranga/TSE/data')
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--hidden_dim', type=int, default=256) 
-    parser.add_argument('--num_layers', type=int, default=6)
+    parser.add_argument('--num_layers', type=int, default=4)
     parser.add_argument('--gpu', type=int, default=0)
-    parser.add_argument('--checkpoint_dir', type=str, default='/workspace/NeuroCodec/checkpoints/neurocodec/KUL/SI/before_gan')
+    parser.add_argument('--checkpoint_dir', type=str, default='/home/avishka/isuranga/TSE/NeuroCodec/checkpoints/CP/mse')
     parser.add_argument('--debug', action='store_true', help="Run fast debug mode")
     parser.add_argument('--dataset', type=str, default='cocktail', choices=['cocktail', 'kul'], help='Dataset to use')
     parser.add_argument('--eeg_channels', type=int, default=128, help='Number of EEG channels (128 for Cocktail, 64 for KUL)')
