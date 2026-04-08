@@ -1,6 +1,7 @@
 
 import os
 import argparse
+import pickle
 import torch
 import time
 from tqdm import tqdm
@@ -78,8 +79,23 @@ def inference(args):
         dropout=args.dropout
     ).to(device)
     
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
-    state_dict = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    try:
+        checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
+    except pickle.UnpicklingError:
+        print("Checkpoint contains full training state; retrying with weights_only=False for a trusted local file.")
+        checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+
+    if isinstance(checkpoint, dict):
+        if "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+        elif "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        elif "model" in checkpoint:
+            state_dict = checkpoint["model"]
+        else:
+            state_dict = checkpoint
+    else:
+        state_dict = checkpoint
     try:
         model.load_state_dict(state_dict)
     except RuntimeError as e:
