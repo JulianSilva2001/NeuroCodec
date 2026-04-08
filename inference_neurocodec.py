@@ -337,7 +337,7 @@ def inference(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', type=str, default='/home/avishka/isuranga/TSE/data')
-    parser.add_argument('--checkpoint', type=str, default='/home/avishka/isuranga/TSE/NeuroCodec/checkpoints/neurocodec/CP/SI/mse_v2/best_model.pth')
+    parser.add_argument('--checkpoint', type=str, default='/home/avishka/isuranga/TSE/NeuroCodec/checkpoints/CP/mse/best_model.pth')
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--subset', type=str, default='val', help="Dataset subset to use (train, val, test)")
     parser.add_argument('--num_samples', type=int, default=10, help="Number of samples to process")
@@ -350,7 +350,7 @@ if __name__ == "__main__":
     parser.add_argument('--backbone', type=str, default='mamba', choices=['mamba', 'transformer'], help='Backbone architecture')
     parser.add_argument('--activation', type=str, default='gelu', choices=['gelu', 'snake', 'relu'], help='Activation function (transformer only)')
     parser.add_argument('--dropout', type=float, default=0.5, help='Dropout rate used in EEG encoder and fusion blocks')
-    parser.add_argument('--num_layers', type=int, default=6)
+    parser.add_argument('--num_layers', type=int, default=4)
     parser.add_argument('--shuffle', action='store_true', default=True, help="Shuffle the dataset to pick random samples")
     parser.add_argument('--estoi_save_threshold', type=float, default=0, help='Only save files for samples with ESTOI greater than this threshold')
     
