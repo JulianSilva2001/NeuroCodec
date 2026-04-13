@@ -219,13 +219,32 @@ def restore_checkpoint(checkpoint, model, discriminator, optimizer_g, optimizer_
         scheduler_d.load_state_dict(checkpoint["scheduler_d_state_dict"])
 
     if "torch_rng_state" in checkpoint:
-        torch.set_rng_state(checkpoint["torch_rng_state"])
+        try:
+            if isinstance(checkpoint["torch_rng_state"], torch.Tensor) and checkpoint["torch_rng_state"].dtype == torch.uint8:
+                torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
+            else:
+                print("Warning: skipping invalid torch RNG state in checkpoint.")
+        except Exception as e:
+            print(f"Warning: could not restore torch RNG state: {e}")
+
     if "numpy_rng_state" in checkpoint:
-        np.random.set_state(checkpoint["numpy_rng_state"])
+        try:
+            np.random.set_state(checkpoint["numpy_rng_state"])
+        except Exception as e:
+            print(f"Warning: could not restore NumPy RNG state: {e}")
+
     if "python_rng_state" in checkpoint:
-        random.setstate(checkpoint["python_rng_state"])
+        try:
+            random.setstate(checkpoint["python_rng_state"])
+        except Exception as e:
+            print(f"Warning: could not restore Python RNG state: {e}")
+
     if torch.cuda.is_available() and "cuda_rng_state_all" in checkpoint:
-        torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state_all"])
+        try:
+            torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state_all"])
+        except Exception as e:
+            print(f"Warning: could not restore CUDA RNG state: {e}")
+
 
     start_epoch = checkpoint.get("epoch", -1) + 1
     best_val_loss = checkpoint.get("best_val_loss", float("inf"))
@@ -729,7 +748,7 @@ def validate(model, loader, criterion, device, args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', type=str, default='/home/avishka/isuranga/TSE/data')
-    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--hidden_dim', type=int, default=256) 
@@ -757,7 +776,7 @@ if __name__ == "__main__":
     parser.add_argument('--phase1_batch_size', type=int, default=64, help='Phase 1 training batch size')
     parser.add_argument('--phase2_lambda_mel_start', type=int, default=2, help='Starting lambda_mel value for phase 2 ramp')
     parser.add_argument('--phase2_lambda_mel_end', type=int, default=15, help='Final lambda_mel value for phase 2 ramp and later phases')
-    parser.add_argument('--phase2_hold_epochs', type=int, default=5, help='Extra phase 2 epochs to keep lambda_mel fixed at the final value')
+    parser.add_argument('--phase2_hold_epochs', type=int, default=0, help='Extra phase 2 epochs to keep lambda_mel fixed at the final value')
     parser.add_argument('--phase2_batch_size', type=int, default=16, help='Phase 2 training batch size')
     parser.add_argument('--phase3_epochs', type=int, default=3, help='Phase 3 duration: discriminator warmup epochs')
     parser.add_argument('--phase3_batch_size', type=int, default=8, help='Phase 3 training batch size')
