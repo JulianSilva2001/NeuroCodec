@@ -165,10 +165,10 @@ def build_loaders(args, target_fs, train_batch_size=None, val_batch_size=None):
     return train_loader, val_loader
 
 
-def build_checkpoint(model, discriminator, optimizer_g, optimizer_d, scheduler_g, scheduler_d, epoch, best_val_loss):
+def build_checkpoint(model, discriminator, optimizer_g, optimizer_d, scheduler_g, scheduler_d, epoch, best_val_sisdr):
     checkpoint = {
         "epoch": epoch,
-        "best_val_loss": best_val_loss,
+        "best_val_sisdr": best_val_sisdr,
         "model_state_dict": model.state_dict(),
         "discriminator_state_dict": discriminator.state_dict(),
         "optimizer_g_state_dict": optimizer_g.state_dict(),
@@ -186,11 +186,11 @@ def build_checkpoint(model, discriminator, optimizer_g, optimizer_d, scheduler_g
 
 def restore_checkpoint(checkpoint, model, discriminator, optimizer_g, optimizer_d, scheduler_g, scheduler_d):
     start_epoch = 0
-    best_val_loss = float("inf")
+    best_val_sisdr = float("-inf")
 
     if not isinstance(checkpoint, dict):
         model.load_state_dict(checkpoint, strict=False)
-        return start_epoch, best_val_loss
+        return start_epoch, best_val_sisdr
 
     if "model_state_dict" in checkpoint:
         model_state = checkpoint["model_state_dict"]
@@ -247,8 +247,8 @@ def restore_checkpoint(checkpoint, model, discriminator, optimizer_g, optimizer_
 
 
     start_epoch = checkpoint.get("epoch", -1) + 1
-    best_val_loss = checkpoint.get("best_val_loss", float("inf"))
-    return start_epoch, best_val_loss
+    best_val_sisdr = checkpoint.get("best_val_sisdr", checkpoint.get("best_val_loss", float("-inf")))
+    return start_epoch, best_val_sisdr
 
 def sisdr(reference, estimation):
     """
@@ -350,18 +350,18 @@ def train(args):
     # Generator Optimizer (NeuroCodec)
     optimizer_g = optim.AdamW(model.parameters(), lr=args.lr, betas=(0.5, 0.9))
     scheduler_g = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer_g, mode='min', factor=0.5, patience=5
+        optimizer_g, mode='max', factor=0.5, patience=5
     )
     
     # Discriminator Optimizer
     optimizer_d = optim.AdamW(discriminator.parameters(), lr=args.lr, betas=(0.5, 0.9))
     scheduler_d = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer_d, mode='min', factor=0.5, patience=5
+        optimizer_d, mode='max', factor=0.5, patience=5
     )
     
     # 5. Training Loop
     start_epoch = 0
-    best_val_loss = float('inf')
+    best_val_sisdr = float('-inf')
 
     # 5.1 Load Checkpoint if Exists (Resume Training)
     latest_checkpoint = os.path.join(args.checkpoint_dir, "latest_model.pth")
@@ -369,7 +369,7 @@ def train(args):
         print(f"Resuming from checkpoint: {latest_checkpoint}")
         try:
             checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=False)
-            start_epoch, best_val_loss = restore_checkpoint(
+            start_epoch, best_val_sisdr = restore_checkpoint(
                 checkpoint,
                 model,
                 discriminator,
@@ -409,6 +409,7 @@ def train(args):
         )
     
     active_train_batch_size = None
+    prev_phase_name = None
     for epoch in range(start_epoch, args.epochs):
         model.train()
         discriminator.train()
@@ -422,8 +423,10 @@ def train(args):
         loss_mode = phase_cfg["loss_mode"]
         lambda_mel = phase_cfg["lambda_mel"]
         train_batch_size = phase_cfg["train_batch_size"]
-        set_optimizer_lr(optimizer_g, phase_cfg["lr_g"])
-        set_optimizer_lr(optimizer_d, phase_cfg["lr_d"])
+        entering_new_phase = phase_cfg["name"] != prev_phase_name
+        if (not phase_cfg["scheduler_active"]) or entering_new_phase:
+            set_optimizer_lr(optimizer_g, phase_cfg["lr_g"])
+            set_optimizer_lr(optimizer_d, phase_cfg["lr_d"])
 
         if active_train_batch_size != train_batch_size:
             train_loader, _ = build_loaders(args, target_fs, train_batch_size=train_batch_size, val_batch_size=args.batch_size)
@@ -574,8 +577,8 @@ def train(args):
             
             # Step Schedulers
             if phase_cfg["scheduler_active"]:
-                scheduler_g.step(val_loss)
-                scheduler_d.step(val_loss)
+                scheduler_g.step(val_sisdr)
+                scheduler_d.step(val_sisdr)
             
             print(
                 f"Epoch {epoch+1} | {phase_cfg['display_name']} | "
@@ -587,8 +590,8 @@ def train(args):
 
             
             # Save Checkpoint (Best)
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            if val_sisdr > best_val_sisdr:
+                best_val_sisdr = val_sisdr
                 torch.save(
                     build_checkpoint(
                         model,
@@ -598,11 +601,11 @@ def train(args):
                         scheduler_g,
                         scheduler_d,
                         epoch,
-                        best_val_loss,
+                        best_val_sisdr,
                     ),
                     os.path.join(args.checkpoint_dir, "best_model.pth")
                 )
-                print("Saved Best Model.")
+                print("Saved Best Model (by Val SI-SDR).")
 
         else:
             print(
@@ -622,10 +625,11 @@ def train(args):
                 scheduler_g,
                 scheduler_d,
                 epoch,
-                best_val_loss,
+                best_val_sisdr,
             ),
             os.path.join(args.checkpoint_dir, "latest_model.pth")
         )
+        prev_phase_name = phase_cfg["name"]
 
 def validate(model, loader, criterion, device, args):
     model.eval()
