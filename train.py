@@ -782,7 +782,7 @@ if __name__ == "__main__":
     parser.add_argument('--phase2_lambda_mel_end', type=int, default=15, help='Final lambda_mel value for phase 2 ramp and later phases')
     parser.add_argument('--phase2_hold_epochs', type=int, default=0, help='Extra phase 2 epochs to keep lambda_mel fixed at the final value')
     parser.add_argument('--phase2_batch_size', type=int, default=16, help='Phase 2 training batch size')
-    parser.add_argument('--phase3_epochs', type=int, default=3, help='Phase 3 duration: discriminator warmup epochs')
+    parser.add_argument('--phase3_epochs', type=int, default=1, help='Phase 3 duration: discriminator warmup epochs')
     parser.add_argument('--phase3_batch_size', type=int, default=8, help='Phase 3 training batch size')
     parser.add_argument('--phase3_lr', type=float, default=1e-5, help='Phase 3 learning rate')
     parser.add_argument('--phase4_lr', type=float, default=1e-5, help='Phase 4 initial learning rate before scheduler updates')
