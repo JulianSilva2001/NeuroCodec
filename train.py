@@ -43,6 +43,11 @@ def set_optimizer_lr(optimizer, lr):
         param_group["lr"] = lr
 
 
+def scale_optimizer_lr(optimizer, scale):
+    for param_group in optimizer.param_groups:
+        param_group["lr"] *= scale
+
+
 def get_phase2_epochs(args):
     ramp_epochs = max(0, args.phase2_lambda_mel_end - args.phase2_lambda_mel_start + 1)
     return ramp_epochs + args.phase2_hold_epochs
@@ -165,10 +170,11 @@ def build_loaders(args, target_fs, train_batch_size=None, val_batch_size=None):
     return train_loader, val_loader
 
 
-def build_checkpoint(model, discriminator, optimizer_g, optimizer_d, scheduler_g, scheduler_d, epoch, best_val_sisdr):
+def build_checkpoint(model, discriminator, optimizer_g, optimizer_d, scheduler_g, scheduler_d, epoch, best_val_sisdr, last_val_sisdr):
     checkpoint = {
         "epoch": epoch,
         "best_val_sisdr": best_val_sisdr,
+        "last_val_sisdr": last_val_sisdr,
         "model_state_dict": model.state_dict(),
         "discriminator_state_dict": discriminator.state_dict(),
         "optimizer_g_state_dict": optimizer_g.state_dict(),
@@ -187,10 +193,11 @@ def build_checkpoint(model, discriminator, optimizer_g, optimizer_d, scheduler_g
 def restore_checkpoint(checkpoint, model, discriminator, optimizer_g, optimizer_d, scheduler_g, scheduler_d):
     start_epoch = 0
     best_val_sisdr = float("-inf")
+    last_val_sisdr = None
 
     if not isinstance(checkpoint, dict):
         model.load_state_dict(checkpoint, strict=False)
-        return start_epoch, best_val_sisdr
+        return start_epoch, best_val_sisdr, last_val_sisdr
 
     if "model_state_dict" in checkpoint:
         model_state = checkpoint["model_state_dict"]
@@ -248,7 +255,8 @@ def restore_checkpoint(checkpoint, model, discriminator, optimizer_g, optimizer_
 
     start_epoch = checkpoint.get("epoch", -1) + 1
     best_val_sisdr = checkpoint.get("best_val_sisdr", checkpoint.get("best_val_loss", float("-inf")))
-    return start_epoch, best_val_sisdr
+    last_val_sisdr = checkpoint.get("last_val_sisdr")
+    return start_epoch, best_val_sisdr, last_val_sisdr
 
 def sisdr(reference, estimation):
     """
@@ -362,6 +370,7 @@ def train(args):
     # 5. Training Loop
     start_epoch = 0
     best_val_sisdr = float('-inf')
+    last_val_sisdr = None
 
     # 5.1 Load Checkpoint if Exists (Resume Training)
     latest_checkpoint = os.path.join(args.checkpoint_dir, "latest_model.pth")
@@ -369,7 +378,7 @@ def train(args):
         print(f"Resuming from checkpoint: {latest_checkpoint}")
         try:
             checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=False)
-            start_epoch, best_val_sisdr = restore_checkpoint(
+            start_epoch, best_val_sisdr, last_val_sisdr = restore_checkpoint(
                 checkpoint,
                 model,
                 discriminator,
@@ -393,7 +402,8 @@ def train(args):
         f"(lambda_mel {args.phase2_lambda_mel_start}->{args.phase2_lambda_mel_end}, "
         f"hold {args.phase2_hold_epochs} epochs) | "
         f"Phase 3: GAN warmup for {args.phase3_epochs} epochs @ lr={args.phase3_lr:.1e} | "
-        f"Phase 4: full training @ lr_g={args.phase4_lr:.1e}, lr_d={args.phase4_d_lr:.1e} with LR scheduler"
+        f"Phase 4: full training @ lr_g={args.phase4_lr:.1e}, lr_d={args.phase4_d_lr:.1e} "
+        "with LR halving on val SI-SDR drop"
     )
     print(
         f"Batch schedule | Phase 1 train batch size: {args.phase1_batch_size} | "
@@ -575,10 +585,15 @@ def train(args):
         if (epoch + 1) % args.val_interval == 0:
             val_loss, val_sisdr, val_estoi = validate(model, val_loader, criterion, device, args)
             
-            # Step Schedulers
-            if phase_cfg["scheduler_active"]:
-                scheduler_g.step(val_sisdr)
-                scheduler_d.step(val_sisdr)
+            if phase_cfg["scheduler_active"] and last_val_sisdr is not None and val_sisdr < last_val_sisdr:
+                scale_optimizer_lr(optimizer_g, 0.5)
+                scale_optimizer_lr(optimizer_d, 0.5)
+                print(
+                    f"Val SI-SDR dropped from {last_val_sisdr:.2f} to {val_sisdr:.2f}. "
+                    f"Halved LR_G to {optimizer_g.param_groups[0]['lr']:.1e} and "
+                    f"LR_D to {optimizer_d.param_groups[0]['lr']:.1e}."
+                )
+            last_val_sisdr = val_sisdr
             
             print(
                 f"Epoch {epoch+1} | {phase_cfg['display_name']} | "
@@ -602,6 +617,7 @@ def train(args):
                         scheduler_d,
                         epoch,
                         best_val_sisdr,
+                        last_val_sisdr,
                     ),
                     os.path.join(args.checkpoint_dir, "best_model.pth")
                 )
@@ -626,6 +642,7 @@ def train(args):
                 scheduler_d,
                 epoch,
                 best_val_sisdr,
+                last_val_sisdr,
             ),
             os.path.join(args.checkpoint_dir, "latest_model.pth")
         )
