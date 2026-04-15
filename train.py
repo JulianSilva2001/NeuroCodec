@@ -118,7 +118,7 @@ def get_training_phase(epoch, args):
         "train_generator": True,
         "scheduler_active": True,
         "lr_g": args.phase4_lr,
-        "lr_d": args.phase4_lr,
+        "lr_d": args.phase4_d_lr,
         "train_batch_size": args.batch_size,
     }
 
@@ -393,7 +393,7 @@ def train(args):
         f"(lambda_mel {args.phase2_lambda_mel_start}->{args.phase2_lambda_mel_end}, "
         f"hold {args.phase2_hold_epochs} epochs) | "
         f"Phase 3: GAN warmup for {args.phase3_epochs} epochs @ lr={args.phase3_lr:.1e} | "
-        f"Phase 4: full training @ lr={args.phase4_lr:.1e} with LR scheduler"
+        f"Phase 4: full training @ lr_g={args.phase4_lr:.1e}, lr_d={args.phase4_d_lr:.1e} with LR scheduler"
     )
     print(
         f"Batch schedule | Phase 1 train batch size: {args.phase1_batch_size} | "
@@ -786,6 +786,7 @@ if __name__ == "__main__":
     parser.add_argument('--phase3_batch_size', type=int, default=8, help='Phase 3 training batch size')
     parser.add_argument('--phase3_lr', type=float, default=1e-5, help='Phase 3 learning rate')
     parser.add_argument('--phase4_lr', type=float, default=1e-5, help='Phase 4 initial learning rate before scheduler updates')
+    parser.add_argument('--phase4_d_lr', type=float, default=2e-6, help='Phase 4 discriminator learning rate before scheduler updates')
     
     parser.add_argument('--lambda_gan', type=float, default=1, help="Weight for GAN Adversarial Loss")
     parser.add_argument('--lambda_feat', type=float, default=2, help="Weight for GAN Feature Matching Loss")
