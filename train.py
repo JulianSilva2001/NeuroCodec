@@ -254,7 +254,12 @@ def restore_checkpoint(checkpoint, model, discriminator, optimizer_g, optimizer_
 
 
     start_epoch = checkpoint.get("epoch", -1) + 1
-    best_val_sisdr = checkpoint.get("best_val_sisdr", checkpoint.get("best_val_loss", float("-inf")))
+    if "best_val_sisdr" in checkpoint:
+        best_val_sisdr = checkpoint["best_val_sisdr"]
+    else:
+        best_val_sisdr = float("-inf")
+        if "best_val_loss" in checkpoint:
+            print("Warning: checkpoint has best_val_loss but no best_val_sisdr; resetting best SI-SDR tracking.")
     last_val_sisdr = checkpoint.get("last_val_sisdr")
     return start_epoch, best_val_sisdr, last_val_sisdr
 
