@@ -353,7 +353,7 @@ def inference(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', type=str, default='/home/avishka/isuranga/TSE/data')
-    parser.add_argument('--checkpoint', type=str, default='/home/avishka/isuranga/TSE/NeuroCodec/checkpoints/CP/mse/best_model.pth')
+    parser.add_argument('--checkpoint', type=str, default='/home/avishka/isuranga/TSE/NeuroCodec/checkpoints/CP/mse/latest_model.pth')
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--subset', type=str, default='val', help="Dataset subset to use (train, val, test)")
     parser.add_argument('--num_samples', type=int, default=10, help="Number of samples to process")
