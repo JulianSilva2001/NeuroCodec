@@ -55,6 +55,15 @@ def inference(args):
     ).to(device)
     
     checkpoint = torch.load(args.checkpoint, map_location=device)
+
+    # Support both plain state_dict checkpoints and wrapped training checkpoints.
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        checkpoint = checkpoint['model_state_dict']
+
+    # Handle DataParallel/DDP checkpoints saved with a 'module.' prefix.
+    if isinstance(checkpoint, dict) and any(k.startswith('module.') for k in checkpoint.keys()):
+        checkpoint = {k.replace('module.', '', 1): v for k, v in checkpoint.items()}
+
     model.load_state_dict(checkpoint)
     model.eval()
     print("Model Loaded.")
@@ -281,8 +290,8 @@ def inference(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root', type=str, default='/workspace/Dataset/kul_all_subjects.lmdb')
-    parser.add_argument('--checkpoint', type=str, default='checkpoints/neurocodec/KUL/mamba-GAN/latest_model.pth')
+    parser.add_argument('--root', type=str, default='/home/jaliya/eeg_speech/navindu/data/Apr-1/lmdb')
+    parser.add_argument('--checkpoint', type=str, default='/home/jaliya/eeg_speech/shaveen/NeuroCodec/checkpoints/neurocodec_KUL/best_model.pth')
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--subset', type=str, default='val', help="Dataset subset to use (train, val, test)")
     parser.add_argument('--num_samples', type=int, default=10, help="Number of samples to process")
