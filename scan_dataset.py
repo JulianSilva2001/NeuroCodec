@@ -129,7 +129,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="cocktail", choices=["cocktail", "kul"])
     parser.add_argument("--root", type=str, required=True, help="Cocktail root dir or KUL LMDB path")
     parser.add_argument("--subset", type=str, default="train", choices=["train", "val", "test"])
-    parser.add_argument("--max_samples", type=int, default=0, help="0 = all samples")
+    parser.add_argument("--max_samples", type=int, default=3, help="0 = all samples")
     parser.add_argument("--log_every", type=int, default=200, help="Progress log interval")
     parser.add_argument("--num_workers", type=int, default=0, help="DataLoader workers")
 
