@@ -271,16 +271,32 @@ def save_eeg_feature_heatmaps(real_outputs: Dict[str, torch.Tensor], ablated_out
     plt.close(fig)
 
 
+def save_raw_cue_heatmaps(cue_inputs: Dict[str, torch.Tensor], output_path: str):
+    cue_modes = ["real", "noise", "zero", "shuffle"]
+    fig, axes = plt.subplots(len(cue_modes), 1, figsize=(14, 12), sharex=True)
+    for idx, cue_mode in enumerate(cue_modes):
+        eeg_np = tensor_to_numpy(cue_inputs[cue_mode][0])
+        axes[idx].imshow(eeg_np, aspect="auto", origin="lower", cmap="coolwarm")
+        axes[idx].set_title(f"raw_eeg ({cue_mode})")
+        axes[idx].set_ylabel("EEG channel")
+    axes[-1].set_xlabel("Time")
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close(fig)
+
+
 def build_summary(
     real_outputs: Dict[str, torch.Tensor],
     ablated_outputs: Dict[str, Dict[str, torch.Tensor]],
     comparisons: Dict[str, Dict[str, Dict[str, float]]],
     gradient_scores: Dict[str, float],
+    cue_inputs: Dict[str, torch.Tensor],
 ) -> Dict:
     summary = {
         "gradient_scores": gradient_scores,
         "cue_deltas": comparisons,
         "real_stage_stats": {key: tensor_stats(value) for key, value in real_outputs.items()},
+        "cue_input_stats": {key: tensor_stats(value) for key, value in cue_inputs.items()},
     }
 
     critical_stages = [
@@ -378,9 +394,11 @@ def main(args):
 
         cue_outputs: Dict[str, Dict[str, torch.Tensor]] = {}
         gradient_scores: Dict[str, float] = {}
+        cue_inputs: Dict[str, torch.Tensor] = {}
 
         for cue_mode in ["real", "noise", "zero", "shuffle"]:
             eeg_variant = apply_eeg_cue_transform(eeg, cue_mode)
+            cue_inputs[cue_mode] = eeg_variant.detach().clone()
             with torch.no_grad():
                 cue_outputs[cue_mode] = detailed_forward(model, noisy, eeg_variant)
             gradient_scores[cue_mode] = eeg_gradient_score(model, noisy, eeg_variant)
@@ -391,7 +409,7 @@ def main(args):
             for cue_mode in ["noise", "zero", "shuffle"]
         }
 
-        summary = build_summary(real_outputs, cue_outputs, comparisons, gradient_scores)
+        summary = build_summary(real_outputs, cue_outputs, comparisons, gradient_scores, cue_inputs)
         summary["dataset"] = dataset_name
         summary["checkpoint"] = checkpoint
         summary["subset"] = subset
@@ -404,6 +422,7 @@ def main(args):
         save_attention_maps(real_outputs, cue_outputs, batch_dir)
         save_waveform_plot(real_outputs, cue_outputs, clean, os.path.join(batch_dir, "waveform_comparison.png"))
         save_eeg_feature_heatmaps(real_outputs, cue_outputs, os.path.join(batch_dir, "eeg_feature_heatmaps.png"))
+        save_raw_cue_heatmaps(cue_inputs, os.path.join(batch_dir, "raw_cue_heatmaps.png"))
 
         print(f"Saved deep inspection outputs to {batch_dir}")
 
