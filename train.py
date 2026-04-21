@@ -68,6 +68,23 @@ def load_config_file(config_path):
     return config
 
 
+def apply_eeg_cue_transform(eeg, cue_mode):
+    if cue_mode == "real":
+        return eeg
+    if cue_mode == "noise":
+        eeg_mean = eeg.mean()
+        eeg_std = eeg.std()
+        return torch.randn_like(eeg) * eeg_std + eeg_mean
+    if cue_mode == "zero":
+        return torch.zeros_like(eeg)
+    if cue_mode == "shuffle":
+        if eeg.shape[0] <= 1:
+            return eeg
+        perm = torch.randperm(eeg.shape[0], device=eeg.device)
+        return eeg[perm]
+    raise ValueError(f"Unknown cue_mode: {cue_mode}")
+
+
 def get_phase2_epochs(args):
     ramp_epochs = max(0, args.phase2_lambda_mel_end - args.phase2_lambda_mel_start + 1)
     return ramp_epochs + args.phase2_hold_epochs
@@ -437,6 +454,7 @@ def train(args):
         f"Phase 4 train batch size: {args.batch_size} | "
         f"Validation batch size: {args.batch_size}"
     )
+    print(f"EEG cue mode: {args.cue_mode}")
     if args.epochs < min_full_training_epoch:
         print(
             f"Warning: epochs={args.epochs} only covers phases 1-3/early transition. "
@@ -483,11 +501,7 @@ def train(args):
             clean = clean.to(device)
             eeg = eeg.to(device)
 
-            if args.noise_cue:
-                # Replace EEG with Gaussian Noise matching statistics
-                eeg_mean = eeg.mean()
-                eeg_std = eeg.std()
-                eeg = torch.randn_like(eeg) * eeg_std + eeg_mean
+            eeg = apply_eeg_cue_transform(eeg, args.cue_mode)
                 
             # --- Generator Forward ---
             # 1. Encode Target (for Recon Loss)
@@ -699,11 +713,7 @@ def validate(model, loader, criterion, device, args):
             clean = clean.to(device)
             eeg = eeg.to(device)
             
-            if args.noise_cue:
-                # Replace EEG with Gaussian Noise matching statistics
-                eeg_mean = eeg.mean()
-                eeg_std = eeg.std()
-                eeg = torch.randn_like(eeg) * eeg_std + eeg_mean
+            eeg = apply_eeg_cue_transform(eeg, args.cue_mode)
             
             if args.val_batches > 0 and batch_idx >= args.val_batches:
                 break
@@ -815,7 +825,8 @@ if __name__ == "__main__":
     parser.add_argument('--eeg_channels', type=int, default=128, help='Number of EEG channels (128 for Cocktail, 64 for KUL)')
     
     parser.add_argument('--evaluate', action='store_true', help="Run validation only")
-    parser.add_argument('--noise_cue', action='store_true', help="Use random noise instead of EEG during validation")
+    parser.add_argument('--noise_cue', action='store_true', help="Compatibility alias for --cue_mode noise")
+    parser.add_argument('--cue_mode', type=str, default='real', choices=['real', 'noise', 'zero', 'shuffle'], help='EEG cue mode to use')
     
     parser.add_argument('--backbone', type=str, default='mamba', choices=['mamba', 'transformer'], help='Backbone architecture')
     parser.add_argument('--activation', type=str, default='gelu', choices=['gelu', 'snake', 'relu'], help='Activation function (transformer only)')
@@ -847,6 +858,8 @@ if __name__ == "__main__":
     
     parser.set_defaults(**config_defaults)
     args = parser.parse_args()
+    if args.noise_cue and args.cue_mode == 'real':
+        args.cue_mode = 'noise'
     print(f"Loaded config: {args.config}")
     
     # Set seed / deterministic behavior

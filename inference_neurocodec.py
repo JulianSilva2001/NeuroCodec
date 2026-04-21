@@ -31,6 +31,23 @@ def load_config_file(config_path):
         raise ValueError(f"Config file must contain a JSON object: {config_path}")
     return config
 
+
+def apply_eeg_cue_transform(eeg, cue_mode):
+    if cue_mode == "real":
+        return eeg
+    if cue_mode == "noise":
+        eeg_mean = eeg.mean()
+        eeg_std = eeg.std()
+        return torch.randn_like(eeg) * eeg_std + eeg_mean
+    if cue_mode == "zero":
+        return torch.zeros_like(eeg)
+    if cue_mode == "shuffle":
+        if eeg.shape[0] <= 1:
+            return eeg
+        perm = torch.randperm(eeg.shape[0], device=eeg.device)
+        return eeg[perm]
+    raise ValueError(f"Unknown cue_mode: {cue_mode}")
+
 def sisdr(reference, estimation):
     """
     Scale-Invariant Signal-to-Distortion Ratio (SI-SDR)
@@ -73,6 +90,7 @@ def format_subject(subject):
 def inference(args):
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     print(f"Inference on {device}...")
+    print(f"EEG cue mode: {args.cue_mode}")
     
     # Configure for Dataset
     if args.dataset == 'kul':
@@ -184,13 +202,15 @@ def inference(args):
         eeg = eeg.to(device)
         clean = clean.to(device)
         
-        if args.noise_cue:
-            # Replace EEG with Noise matching the statistics of the real EEG
-            # This ensures we test "Information Content" not "Signal Magnitude"
-            eeg_mean = eeg.mean()
-            eeg_std = eeg.std()
-            eeg = torch.randn_like(eeg) * eeg_std + eeg_mean
-            print(f"  [Noise Cue] Replaced EEG with Gaussian Noise (Mean: {eeg_mean:.2f}, Std: {eeg_std:.2f})")
+        if args.cue_mode == "shuffle" and eeg.shape[0] <= 1:
+            print("  [Cue Mode] shuffle requested but batch size is 1; EEG remains unchanged for this sample.")
+        eeg = apply_eeg_cue_transform(eeg, args.cue_mode)
+        if args.cue_mode == "noise":
+            print("  [Cue Mode] Replaced EEG with Gaussian noise.")
+        elif args.cue_mode == "zero":
+            print("  [Cue Mode] Replaced EEG with zeros.")
+        elif args.cue_mode == "shuffle":
+            print("  [Cue Mode] Replaced EEG with shuffled batch EEG.")
             
         with torch.no_grad():
             # Forward Pass
@@ -211,9 +231,7 @@ def inference(args):
             pred_audio = model.dac.decode(z_q)
             
         # 4. Save Audio
-        output_dir = "results/NeuroCodec/KUL/mse/real_eeg"
-        if args.noise_cue:
-            output_dir = "results/NeuroCodec/KUL/mse/Inference_NoiseCue"
+        output_dir = f"results/NeuroCodec/{args.dataset.upper()}/mse/{args.cue_mode}_eeg"
             
         os.makedirs(output_dir, exist_ok=True)
         
@@ -392,7 +410,8 @@ if __name__ == "__main__":
     parser.add_argument('--gpu', type=int)
     parser.add_argument('--subset', type=str, default='val', help="Dataset subset to use (train, val, test)")
     parser.add_argument('--num_samples', type=int, default=10, help="Number of samples to process")
-    parser.add_argument('--noise_cue', action='store_true', help="Use random noise instead of EEG as input")
+    parser.add_argument('--noise_cue', action='store_true', help="Compatibility alias for --cue_mode noise")
+    parser.add_argument('--cue_mode', type=str, default='real', choices=['real', 'noise', 'zero', 'shuffle'], help='EEG cue mode to use')
     parser.add_argument('--hidden_dim', type=int, help="Hidden dimension of the model")
     parser.add_argument('--use_fast_bss', action='store_true', default=True, help="Use fast_bss_eval for SIR-SDR")
     
@@ -407,6 +426,8 @@ if __name__ == "__main__":
     
     parser.set_defaults(**config_defaults)
     args = parser.parse_args()
+    if args.noise_cue and args.cue_mode == 'real':
+        args.cue_mode = 'noise'
     print(f"Loaded config: {args.config}")
 
     inference(args)
