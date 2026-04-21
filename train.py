@@ -793,8 +793,8 @@ def validate(model, loader, criterion, device, args):
 
 if __name__ == "__main__":
     bootstrap_parser = argparse.ArgumentParser(add_help=False)
-    bootstrap_parser.add_argument('--dataset', type=str, default='cocktail', choices=['cocktail', 'kul'])
-    bootstrap_parser.add_argument('--config', type=str, default=None, help='Path to a dataset-specific JSON config file')
+    bootstrap_parser.add_argument('--dataset', type=str, default='kul', choices=['cocktail', 'kul'])
+    bootstrap_parser.add_argument('--config', type=str, default="/home/avishka/isuranga/TSE/NeuroCodec/configs/train_kul.json", help='Path to a dataset-specific JSON config file')
     bootstrap_args, _ = bootstrap_parser.parse_known_args()
 
     config_path = bootstrap_args.config or get_default_config_path(bootstrap_args.dataset)

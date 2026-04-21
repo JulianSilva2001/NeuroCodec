@@ -191,9 +191,9 @@ def inference(args):
             pred_audio = model.dac.decode(z_q)
             
         # 4. Save Audio
-        output_dir = "results/NeuroCodec/cocktail_SI/final_20000/Inference"
+        output_dir = "results/NeuroCodec/KUL/mse/real_eeg"
         if args.noise_cue:
-            output_dir = "results/NeuroCodec/cocktail_SI/final_20000/Inference_NoiseCue"
+            output_dir = "results/NeuroCodec/KUL/mse/Inference_NoiseCue"
             
         os.makedirs(output_dir, exist_ok=True)
         
@@ -352,8 +352,8 @@ def inference(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root', type=str, default='/home/avishka/isuranga/TSE/data')
-    parser.add_argument('--checkpoint', type=str, default='/home/avishka/isuranga/TSE/NeuroCodec/checkpoints/CP/mse/latest_model.pth')
+    parser.add_argument('--root', type=str, default='/home/avishka/isuranga/TSE/KUL-mix/KUL_eeg/kul_all_subjects.lmdb')
+    parser.add_argument('--checkpoint', type=str, default='/home/avishka/isuranga/TSE/NeuroCodec/checkpoints/KUL/mse/latest_model.pth')
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--subset', type=str, default='val', help="Dataset subset to use (train, val, test)")
     parser.add_argument('--num_samples', type=int, default=10, help="Number of samples to process")
@@ -361,8 +361,8 @@ if __name__ == "__main__":
     parser.add_argument('--hidden_dim', type=int, default=256, help="Hidden dimension of the model (default: 128)")
     parser.add_argument('--use_fast_bss', action='store_true', default=True, help="Use fast_bss_eval for SIR-SDR")
     
-    parser.add_argument('--dataset', type=str, default='cocktail', choices=['cocktail', 'kul'], help='Dataset to use')
-    parser.add_argument('--eeg_channels', type=int, default=128, help='Number of EEG channels (128 for Cocktail, 64 for KUL)')
+    parser.add_argument('--dataset', type=str, default='kul', choices=['cocktail', 'kul'], help='Dataset to use')
+    parser.add_argument('--eeg_channels', type=int, default=64, help='Number of EEG channels (128 for Cocktail, 64 for KUL)')
     parser.add_argument('--backbone', type=str, default='mamba', choices=['mamba', 'transformer'], help='Backbone architecture')
     parser.add_argument('--activation', type=str, default='gelu', choices=['gelu', 'snake', 'relu'], help='Activation function (transformer only)')
     parser.add_argument('--dropout', type=float, default=0.5, help='Dropout rate used in EEG encoder and fusion blocks')

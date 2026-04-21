@@ -1,7 +1,7 @@
 {
   "dataset": "cocktail",
   "root": "/home/avishka/isuranga/TSE/data",
-  "checkpoint_dir": "/home/avishka/isuranga/TSE/NeuroCodec/checkpoints/CP/default",
+  "checkpoint_dir": "/home/avishka/isuranga/TSE/NeuroCodec/checkpoints/CP/mse",
   "batch_size": 8,
   "lr": 5e-05,
   "epochs": 50,
