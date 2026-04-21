@@ -1,6 +1,7 @@
 
 import os
 import argparse
+import json
 import pickle
 import torch
 import time
@@ -10,6 +11,25 @@ import scipy.signal
 import torchaudio
 from models.neurocodec import NeuroCodec
 from dataset_neurocodec import load_NeuroCodecDataset, load_KUL_NeuroCodecDataset
+
+
+def get_inference_config_path(dataset_key):
+    config_dir = os.path.join(os.path.dirname(__file__), "configs")
+    config_map = {
+        "CP": "train_cocktail.json",
+        "KUL": "train_kul.json",
+    }
+    if dataset_key not in config_map:
+        raise ValueError(f"Unknown dataset key: {dataset_key}")
+    return os.path.join(config_dir, config_map[dataset_key])
+
+
+def load_config_file(config_path):
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+    if not isinstance(config, dict):
+        raise ValueError(f"Config file must contain a JSON object: {config_path}")
+    return config
 
 def sisdr(reference, estimation):
     """
@@ -351,25 +371,42 @@ def inference(args):
             print(f"Skipped saving sample {file_id} (ESTOI {estoi_val:.4f} <= {args.estoi_save_threshold:.2f})")
 
 if __name__ == "__main__":
+    bootstrap_parser = argparse.ArgumentParser(add_help=False)
+    bootstrap_parser.add_argument('dataset_key', choices=['CP', 'KUL'], help='Inference profile to use')
+    bootstrap_args, _ = bootstrap_parser.parse_known_args()
+
+    config_path = get_inference_config_path(bootstrap_args.dataset_key)
+    config_defaults = load_config_file(config_path)
+    config_defaults = dict(config_defaults)
+    config_defaults["dataset"] = "cocktail" if bootstrap_args.dataset_key == "CP" else "kul"
+    config_defaults["checkpoint"] = config_defaults.get(
+        "checkpoint",
+        os.path.join(config_defaults["checkpoint_dir"], "best_model.pth")
+    )
+
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root', type=str, default='/home/avishka/isuranga/TSE/KUL-mix/KUL_eeg/kul_all_subjects.lmdb')
-    parser.add_argument('--checkpoint', type=str, default='/home/avishka/isuranga/TSE/NeuroCodec/checkpoints/KUL/mse/latest_model.pth')
-    parser.add_argument('--gpu', type=int, default=0)
+    parser.add_argument('dataset_key', choices=['CP', 'KUL'], help='Inference profile to use')
+    parser.add_argument('--config', type=str, default=config_path, help='Resolved config file used for inference defaults')
+    parser.add_argument('--root', type=str)
+    parser.add_argument('--checkpoint', type=str)
+    parser.add_argument('--gpu', type=int)
     parser.add_argument('--subset', type=str, default='val', help="Dataset subset to use (train, val, test)")
     parser.add_argument('--num_samples', type=int, default=10, help="Number of samples to process")
     parser.add_argument('--noise_cue', action='store_true', help="Use random noise instead of EEG as input")
-    parser.add_argument('--hidden_dim', type=int, default=256, help="Hidden dimension of the model (default: 128)")
+    parser.add_argument('--hidden_dim', type=int, help="Hidden dimension of the model")
     parser.add_argument('--use_fast_bss', action='store_true', default=True, help="Use fast_bss_eval for SIR-SDR")
     
-    parser.add_argument('--dataset', type=str, default='kul', choices=['cocktail', 'kul'], help='Dataset to use')
-    parser.add_argument('--eeg_channels', type=int, default=64, help='Number of EEG channels (128 for Cocktail, 64 for KUL)')
-    parser.add_argument('--backbone', type=str, default='mamba', choices=['mamba', 'transformer'], help='Backbone architecture')
-    parser.add_argument('--activation', type=str, default='gelu', choices=['gelu', 'snake', 'relu'], help='Activation function (transformer only)')
-    parser.add_argument('--dropout', type=float, default=0.5, help='Dropout rate used in EEG encoder and fusion blocks')
-    parser.add_argument('--num_layers', type=int, default=4)
+    parser.add_argument('--dataset', type=str, choices=['cocktail', 'kul'])
+    parser.add_argument('--eeg_channels', type=int, help='Number of EEG channels (128 for Cocktail, 64 for KUL)')
+    parser.add_argument('--backbone', type=str, choices=['mamba', 'transformer'], help='Backbone architecture')
+    parser.add_argument('--activation', type=str, choices=['gelu', 'snake', 'relu'], help='Activation function (transformer only)')
+    parser.add_argument('--dropout', type=float, help='Dropout rate used in EEG encoder and fusion blocks')
+    parser.add_argument('--num_layers', type=int)
     parser.add_argument('--shuffle', action='store_true', default=True, help="Shuffle the dataset to pick random samples")
     parser.add_argument('--estoi_save_threshold', type=float, default=0, help='Only save files for samples with ESTOI greater than this threshold')
     
+    parser.set_defaults(**config_defaults)
     args = parser.parse_args()
-    
+    print(f"Loaded config: {args.config}")
+
     inference(args)
