@@ -2,6 +2,7 @@
 import os
 import argparse
 import random
+import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -46,6 +47,25 @@ def set_optimizer_lr(optimizer, lr):
 def scale_optimizer_lr(optimizer, scale):
     for param_group in optimizer.param_groups:
         param_group["lr"] *= scale
+
+
+def get_default_config_path(dataset):
+    config_dir = os.path.join(os.path.dirname(__file__), "configs")
+    config_map = {
+        "cocktail": "train_cocktail.json",
+        "kul": "train_kul.json",
+    }
+    if dataset not in config_map:
+        raise ValueError(f"Unknown dataset for config selection: {dataset}")
+    return os.path.join(config_dir, config_map[dataset])
+
+
+def load_config_file(config_path):
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+    if not isinstance(config, dict):
+        raise ValueError(f"Config file must contain a JSON object: {config_path}")
+    return config
 
 
 def get_phase2_epochs(args):
@@ -772,7 +792,16 @@ def validate(model, loader, criterion, device, args):
     return mean_loss, mean_sisdr, mean_estoi
 
 if __name__ == "__main__":
+    bootstrap_parser = argparse.ArgumentParser(add_help=False)
+    bootstrap_parser.add_argument('--dataset', type=str, default='cocktail', choices=['cocktail', 'kul'])
+    bootstrap_parser.add_argument('--config', type=str, default=None, help='Path to a dataset-specific JSON config file')
+    bootstrap_args, _ = bootstrap_parser.parse_known_args()
+
+    config_path = bootstrap_args.config or get_default_config_path(bootstrap_args.dataset)
+    config_defaults = load_config_file(config_path)
+
     parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default=config_path, help='Path to a dataset-specific JSON config file')
     parser.add_argument('--root', type=str, default='/home/avishka/isuranga/TSE/data')
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--lr', type=float, default=5e-5)
@@ -816,7 +845,9 @@ if __name__ == "__main__":
     parser.add_argument('--disc_warmup_epochs', type=int, default=0, help="Number of epochs to freeze Generator for Discriminator warmup")
     parser.add_argument('--loss', type=str, default='full', choices=['mse', 'full'], help="Loss mode: 'mse' = latent MSE only (no decoder), 'full' = MSE + Mel + GAN (requires decoder)")
     
+    parser.set_defaults(**config_defaults)
     args = parser.parse_args()
+    print(f"Loaded config: {args.config}")
     
     # Set seed / deterministic behavior
     set_global_seed(args.seed)
