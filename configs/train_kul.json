@@ -1,7 +1,7 @@
 {
   "dataset": "kul",
   "root": "/home/avishka/isuranga/TSE/KUL-mix/KUL_eeg/kul_all_subjects.lmdb",
-  "checkpoint_dir": "/home/avishka/isuranga/TSE/NeuroCodec/checkpoints/KUL/mse",
+  "checkpoint_dir": "/home/avishka/isuranga/TSE/NeuroCodec/checkpoints/KUL/v1",
   "batch_size": 8,
   "lr": 5e-5,
   "epochs": 50,
@@ -22,7 +22,7 @@
   "estoi": false,
   "seed": 42,
   "phase1_epochs": 8,
-  "phase1_mse_threshold": 0.87,
+  "phase1_mse_threshold": 8.7,
   "phase1_lr": 0.001,
   "phase1_batch_size": 64,
   "phase2_lambda_mel_start": 2,
