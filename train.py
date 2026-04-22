@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 import numpy as np
@@ -83,6 +84,24 @@ def apply_eeg_cue_transform(eeg, cue_mode):
         perm = torch.randperm(eeg.shape[0], device=eeg.device)
         return eeg[perm]
     raise ValueError(f"Unknown cue_mode: {cue_mode}")
+
+
+def append_epoch_log(json_path, epoch_record):
+    if os.path.exists(json_path):
+        with open(json_path, "r", encoding="utf-8") as f:
+            try:
+                history = json.load(f)
+            except json.JSONDecodeError:
+                history = []
+    else:
+        history = []
+
+    if not isinstance(history, list):
+        history = []
+
+    history.append(epoch_record)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2)
 
 
 def create_initial_phase_state(args):
@@ -460,6 +479,9 @@ def train(args):
 
     # 5.1 Load Checkpoint if Exists (Resume Training)
     latest_checkpoint = os.path.join(args.checkpoint_dir, "latest_model.pth")
+    tensorboard_dir = os.path.join(args.checkpoint_dir, "tensorboard")
+    metrics_json_path = os.path.join(args.checkpoint_dir, "epoch_metrics.json")
+    writer = SummaryWriter(log_dir=tensorboard_dir)
     if os.path.exists(latest_checkpoint):
         print(f"Resuming from checkpoint: {latest_checkpoint}")
         try:
@@ -498,6 +520,8 @@ def train(args):
         f"Validation batch size: {args.batch_size}"
     )
     print(f"EEG cue mode: {args.cue_mode}")
+    print(f"TensorBoard log dir: {tensorboard_dir}")
+    print(f"Epoch JSON log: {metrics_json_path}")
     
     active_train_batch_size = None
     prev_phase_name = None
@@ -722,6 +746,44 @@ def train(args):
             validation_ran=validation_ran,
         )
 
+        epoch_record = {
+            "epoch": epoch + 1,
+            "phase": phase_cfg["name"],
+            "phase_display_name": phase_cfg["display_name"],
+            "next_phase": phase_state["current_phase"],
+            "lambda_mel": float(lambda_mel),
+            "train_batch_size": int(train_batch_size),
+            "lr_g": float(optimizer_g.param_groups[0]["lr"]),
+            "lr_d": float(optimizer_d.param_groups[0]["lr"]),
+            "train_loss": float(train_loss_avg),
+            "train_mse": float(train_mse_avg),
+            "train_g_loss": float(total_g_loss / len(train_loader)) if len(train_loader) > 0 else 0.0,
+            "train_d_loss": float(total_d_loss / len(train_loader)) if len(train_loader) > 0 else 0.0,
+            "val_ran": bool(validation_ran),
+            "val_loss": None if val_loss is None else float(val_loss),
+            "val_sisdr": None if val_sisdr is None else float(val_sisdr),
+            "val_estoi": None if val_estoi is None else float(val_estoi),
+            "best_val_sisdr": float(best_val_sisdr),
+            "cue_mode": args.cue_mode,
+        }
+        append_epoch_log(metrics_json_path, epoch_record)
+
+        writer.add_scalar("train/loss", train_loss_avg, epoch + 1)
+        writer.add_scalar("train/mse", train_mse_avg, epoch + 1)
+        writer.add_scalar("train/g_loss", total_g_loss / len(train_loader), epoch + 1)
+        writer.add_scalar("train/d_loss", total_d_loss / len(train_loader), epoch + 1)
+        writer.add_scalar("train/lambda_mel", lambda_mel, epoch + 1)
+        writer.add_scalar("train/batch_size", train_batch_size, epoch + 1)
+        writer.add_scalar("lr/generator", optimizer_g.param_groups[0]["lr"], epoch + 1)
+        writer.add_scalar("lr/discriminator", optimizer_d.param_groups[0]["lr"], epoch + 1)
+        writer.add_text("phase/current", phase_cfg["name"], epoch + 1)
+        writer.add_text("phase/next", phase_state["current_phase"], epoch + 1)
+        if validation_ran:
+            writer.add_scalar("val/loss", val_loss, epoch + 1)
+            writer.add_scalar("val/sisdr", val_sisdr, epoch + 1)
+            writer.add_scalar("val/estoi", val_estoi, epoch + 1)
+            writer.add_scalar("val/best_sisdr", best_val_sisdr, epoch + 1)
+
         
         # Save Latest Checkpoint (Every Epoch)
         torch.save(
@@ -740,6 +802,8 @@ def train(args):
             os.path.join(args.checkpoint_dir, "latest_model.pth")
         )
         prev_phase_name = phase_cfg["name"]
+
+    writer.close()
 
 def validate(model, loader, criterion, device, args):
     model.eval()
