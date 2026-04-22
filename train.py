@@ -85,19 +85,20 @@ def apply_eeg_cue_transform(eeg, cue_mode):
     raise ValueError(f"Unknown cue_mode: {cue_mode}")
 
 
-def get_phase2_epochs(args):
-    ramp_epochs = max(0, args.phase2_lambda_mel_end - args.phase2_lambda_mel_start + 1)
-    return ramp_epochs + args.phase2_hold_epochs
+def create_initial_phase_state(args):
+    return {
+        "current_phase": "phase1_mse",
+        "phase2_lambda_mel": float(args.phase2_lambda_mel_start),
+        "phase2_prev_val_sisdr": None,
+        "phase2_drop_streak": 0,
+        "phase3_epochs_done": 0,
+    }
 
 
-def get_training_phase(epoch, args):
-    phase1_end = args.phase1_epochs
-    phase2_ramp_epochs = max(0, args.phase2_lambda_mel_end - args.phase2_lambda_mel_start + 1)
-    phase2_epochs = get_phase2_epochs(args)
-    phase2_end = phase1_end + phase2_epochs
-    phase3_end = phase2_end + args.phase3_epochs
+def get_training_phase(phase_state, args):
+    current_phase = phase_state["current_phase"]
 
-    if epoch < phase1_end:
+    if current_phase == "phase1_mse":
         return {
             "name": "phase1_mse",
             "display_name": "Phase 1 MSE",
@@ -111,24 +112,13 @@ def get_training_phase(epoch, args):
             "train_batch_size": args.phase1_batch_size,
         }
 
-    if epoch < phase2_end:
-        phase2_offset = epoch - phase1_end
-        if phase2_offset < phase2_ramp_epochs:
-            lambda_mel = min(
-                args.phase2_lambda_mel_start + phase2_offset,
-                args.phase2_lambda_mel_end,
-            )
-            phase2_name = "phase2_mel_ramp"
-            phase2_display_name = "Phase 2 Mel Ramp"
-        else:
-            lambda_mel = args.phase2_lambda_mel_end
-            phase2_name = "phase2_mel_hold"
-            phase2_display_name = "Phase 2 Mel Hold"
+    if current_phase in {"phase2_mel_ramp", "phase2_mel_hold"}:
+        lambda_mel = float(phase_state["phase2_lambda_mel"])
         return {
-            "name": phase2_name,
-            "display_name": phase2_display_name,
+            "name": current_phase,
+            "display_name": "Phase 2 Mel Ramp" if current_phase == "phase2_mel_ramp" else "Phase 2 Mel Hold",
             "loss_mode": "full",
-            "lambda_mel": float(lambda_mel),
+            "lambda_mel": lambda_mel,
             "use_gan": False,
             "train_generator": True,
             "scheduler_active": False,
@@ -137,7 +127,7 @@ def get_training_phase(epoch, args):
             "train_batch_size": args.phase2_batch_size,
         }
 
-    if epoch < phase3_end:
+    if current_phase == "phase3_gan_warmup":
         return {
             "name": "phase3_gan_warmup",
             "display_name": "Phase 3 GAN Warmup",
@@ -207,11 +197,12 @@ def build_loaders(args, target_fs, train_batch_size=None, val_batch_size=None):
     return train_loader, val_loader
 
 
-def build_checkpoint(model, discriminator, optimizer_g, optimizer_d, scheduler_g, scheduler_d, epoch, best_val_sisdr, last_val_sisdr):
+def build_checkpoint(model, discriminator, optimizer_g, optimizer_d, scheduler_g, scheduler_d, epoch, best_val_sisdr, last_val_sisdr, phase_state):
     checkpoint = {
         "epoch": epoch,
         "best_val_sisdr": best_val_sisdr,
         "last_val_sisdr": last_val_sisdr,
+        "phase_state": phase_state,
         "model_state_dict": model.state_dict(),
         "discriminator_state_dict": discriminator.state_dict(),
         "optimizer_g_state_dict": optimizer_g.state_dict(),
@@ -231,10 +222,11 @@ def restore_checkpoint(checkpoint, model, discriminator, optimizer_g, optimizer_
     start_epoch = 0
     best_val_sisdr = float("-inf")
     last_val_sisdr = None
+    phase_state = None
 
     if not isinstance(checkpoint, dict):
         model.load_state_dict(checkpoint, strict=False)
-        return start_epoch, best_val_sisdr, last_val_sisdr
+        return start_epoch, best_val_sisdr, last_val_sisdr, phase_state
 
     if "model_state_dict" in checkpoint:
         model_state = checkpoint["model_state_dict"]
@@ -298,7 +290,58 @@ def restore_checkpoint(checkpoint, model, discriminator, optimizer_g, optimizer_
         if "best_val_loss" in checkpoint:
             print("Warning: checkpoint has best_val_loss but no best_val_sisdr; resetting best SI-SDR tracking.")
     last_val_sisdr = checkpoint.get("last_val_sisdr")
-    return start_epoch, best_val_sisdr, last_val_sisdr
+    phase_state = checkpoint.get("phase_state")
+    return start_epoch, best_val_sisdr, last_val_sisdr, phase_state
+
+
+def update_phase_state(phase_state, phase_cfg, args, train_mse_avg, val_sisdr, validation_ran):
+    current_phase = phase_state["current_phase"]
+
+    if current_phase == "phase1_mse":
+        if train_mse_avg < args.phase1_mse_threshold:
+            phase_state["current_phase"] = "phase2_mel_ramp"
+            phase_state["phase2_lambda_mel"] = float(args.phase2_lambda_mel_start)
+            phase_state["phase2_prev_val_sisdr"] = None
+            phase_state["phase2_drop_streak"] = 0
+            print(
+                f"Phase transition: Phase 1 -> Phase 2 because train MSE {train_mse_avg:.4f} "
+                f"is below threshold {args.phase1_mse_threshold:.4f}."
+            )
+        return phase_state
+
+    if current_phase in {"phase2_mel_ramp", "phase2_mel_hold"}:
+        if current_phase == "phase2_mel_ramp":
+            if phase_state["phase2_lambda_mel"] < args.phase2_lambda_mel_end:
+                phase_state["phase2_lambda_mel"] = min(
+                    phase_state["phase2_lambda_mel"] + 1,
+                    float(args.phase2_lambda_mel_end),
+                )
+            if phase_state["phase2_lambda_mel"] >= args.phase2_lambda_mel_end:
+                phase_state["current_phase"] = "phase2_mel_hold"
+                print("Phase transition: Phase 2 Ramp -> Phase 2 Hold.")
+        else:
+            if validation_ran:
+                prev_val = phase_state["phase2_prev_val_sisdr"]
+                if prev_val is not None and val_sisdr < prev_val:
+                    phase_state["phase2_drop_streak"] += 1
+                else:
+                    phase_state["phase2_drop_streak"] = 0
+                phase_state["phase2_prev_val_sisdr"] = val_sisdr
+
+                if phase_state["phase2_drop_streak"] >= 2:
+                    phase_state["current_phase"] = "phase3_gan_warmup"
+                    phase_state["phase3_epochs_done"] = 0
+                    print("Phase transition: Phase 2 Hold -> Phase 3 after two consecutive validation SI-SDR drops.")
+        return phase_state
+
+    if current_phase == "phase3_gan_warmup":
+        phase_state["phase3_epochs_done"] += 1
+        if phase_state["phase3_epochs_done"] >= args.phase3_epochs:
+            phase_state["current_phase"] = "phase4_full"
+            print("Phase transition: Phase 3 -> Phase 4.")
+        return phase_state
+
+    return phase_state
 
 def sisdr(reference, estimation):
     """
@@ -400,19 +443,20 @@ def train(args):
     # Generator Optimizer (NeuroCodec)
     optimizer_g = optim.AdamW(model.parameters(), lr=args.lr, betas=(0.5, 0.9))
     scheduler_g = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer_g, mode='max', factor=0.5, patience=5
+        optimizer_g, mode='max', factor=args.phase4_scheduler_factor, patience=args.phase4_scheduler_patience
     )
     
     # Discriminator Optimizer
     optimizer_d = optim.AdamW(discriminator.parameters(), lr=args.lr, betas=(0.5, 0.9))
     scheduler_d = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer_d, mode='max', factor=0.5, patience=5
+        optimizer_d, mode='max', factor=args.phase4_scheduler_factor, patience=args.phase4_scheduler_patience
     )
     
     # 5. Training Loop
     start_epoch = 0
     best_val_sisdr = float('-inf')
     last_val_sisdr = None
+    phase_state = create_initial_phase_state(args)
 
     # 5.1 Load Checkpoint if Exists (Resume Training)
     latest_checkpoint = os.path.join(args.checkpoint_dir, "latest_model.pth")
@@ -420,7 +464,7 @@ def train(args):
         print(f"Resuming from checkpoint: {latest_checkpoint}")
         try:
             checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=False)
-            start_epoch, best_val_sisdr, last_val_sisdr = restore_checkpoint(
+            start_epoch, best_val_sisdr, last_val_sisdr, restored_phase_state = restore_checkpoint(
                 checkpoint,
                 model,
                 discriminator,
@@ -429,23 +473,22 @@ def train(args):
                 scheduler_g,
                 scheduler_d,
             )
+            if restored_phase_state is not None:
+                phase_state = restored_phase_state
             print(f"Checkpoint loaded. Resuming at epoch {start_epoch + 1}.")
         except Exception as e:
             print(f"Failed to load checkpoint: {e}. Starting from scratch.")
     else:
         print("No existing checkpoint found. Starting from scratch.")
 
-    phase2_epochs = get_phase2_epochs(args)
-    min_full_training_epoch = args.phase1_epochs + phase2_epochs + args.phase3_epochs + 1
     print(
         "Training schedule | "
-        f"Phase 1: MSE-only for {args.phase1_epochs} epochs @ lr={args.phase1_lr:.1e} | "
-        f"Phase 2: mel ramp/hold for {phase2_epochs} epochs "
-        f"(lambda_mel {args.phase2_lambda_mel_start}->{args.phase2_lambda_mel_end}, "
-        f"hold {args.phase2_hold_epochs} epochs) | "
+        f"Phase 1: MSE-only until train MSE < {args.phase1_mse_threshold:.4f} @ lr={args.phase1_lr:.1e} | "
+        f"Phase 2: mel ramp {args.phase2_lambda_mel_start}->{args.phase2_lambda_mel_end}, "
+        "then hold until validation SI-SDR drops for 2 consecutive validations | "
         f"Phase 3: GAN warmup for {args.phase3_epochs} epochs @ lr={args.phase3_lr:.1e} | "
         f"Phase 4: full training @ lr_g={args.phase4_lr:.1e}, lr_d={args.phase4_d_lr:.1e} "
-        "with LR halving on val SI-SDR drop"
+        f"with ReduceLROnPlateau patience={args.phase4_scheduler_patience}"
     )
     print(
         f"Batch schedule | Phase 1 train batch size: {args.phase1_batch_size} | "
@@ -455,11 +498,6 @@ def train(args):
         f"Validation batch size: {args.batch_size}"
     )
     print(f"EEG cue mode: {args.cue_mode}")
-    if args.epochs < min_full_training_epoch:
-        print(
-            f"Warning: epochs={args.epochs} only covers phases 1-3/early transition. "
-            f"Use at least {min_full_training_epoch} epochs to enter Phase 4."
-        )
     
     active_train_batch_size = None
     prev_phase_name = None
@@ -467,10 +505,11 @@ def train(args):
         model.train()
         discriminator.train()
         total_loss = 0
+        total_mse = 0
         total_g_loss = 0
         total_d_loss = 0
 
-        phase_cfg = get_training_phase(epoch, args)
+        phase_cfg = get_training_phase(phase_state, args)
         use_gan = phase_cfg["use_gan"]
         train_generator_epoch = phase_cfg["train_generator"]
         loss_mode = phase_cfg["loss_mode"]
@@ -524,6 +563,7 @@ def train(args):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer_g.step()
                 total_loss += recon_loss.item()
+                total_mse += loss_dict['loss_recon']
                 log_recon_loss = recon_loss.item()
                 d_loss = torch.tensor(0.0)
             else:
@@ -580,6 +620,7 @@ def train(args):
                     optimizer_g.step()
                     
                     total_loss += recon_loss.item()
+                    total_mse += loss_dict['loss_recon']
                     log_recon_loss = recon_loss.item()
                 else:
                     # Generator Frozen: Calculate loss for logging but don't backward
@@ -620,23 +661,25 @@ def train(args):
                 break
                 
         
+        train_loss_avg = total_loss / len(train_loader)
+        train_mse_avg = total_mse / len(train_loader)
+        validation_ran = (epoch + 1) % args.val_interval == 0
+        val_loss = None
+        val_sisdr = None
+        val_estoi = None
+
         # Validation
         if (epoch + 1) % args.val_interval == 0:
             val_loss, val_sisdr, val_estoi = validate(model, val_loader, criterion, device, args)
             
-            if phase_cfg["scheduler_active"] and last_val_sisdr is not None and val_sisdr < last_val_sisdr:
-                scale_optimizer_lr(optimizer_g, 0.5)
-                scale_optimizer_lr(optimizer_d, 0.5)
-                print(
-                    f"Val SI-SDR dropped from {last_val_sisdr:.2f} to {val_sisdr:.2f}. "
-                    f"Halved LR_G to {optimizer_g.param_groups[0]['lr']:.1e} and "
-                    f"LR_D to {optimizer_d.param_groups[0]['lr']:.1e}."
-                )
+            if phase_cfg["scheduler_active"]:
+                scheduler_g.step(val_sisdr)
+                scheduler_d.step(val_sisdr)
             last_val_sisdr = val_sisdr
             
             print(
                 f"Epoch {epoch+1} | {phase_cfg['display_name']} | "
-                f"Train Loss: {total_loss/len(train_loader):.4f} | "
+                f"Train Loss: {train_loss_avg:.4f} | Train MSE: {train_mse_avg:.4f} | "
                 f"Val Loss: {val_loss:.4f} | Val SI-SDR: {val_sisdr:.2f} dB | "
                 f"Val ESTOI: {val_estoi:.4f} | lambda_mel: {lambda_mel:.1f}"
             )
@@ -657,6 +700,7 @@ def train(args):
                         epoch,
                         best_val_sisdr,
                         last_val_sisdr,
+                        phase_state,
                     ),
                     os.path.join(args.checkpoint_dir, "best_model.pth")
                 )
@@ -665,9 +709,18 @@ def train(args):
         else:
             print(
                 f"Epoch {epoch+1} | {phase_cfg['display_name']} | "
-                f"Train Loss: {total_loss/len(train_loader):.4f} | "
+                f"Train Loss: {train_loss_avg:.4f} | Train MSE: {train_mse_avg:.4f} | "
                 f"Validation Skipped | lambda_mel: {lambda_mel:.1f}"
             )
+
+        phase_state = update_phase_state(
+            phase_state,
+            phase_cfg,
+            args,
+            train_mse_avg=train_mse_avg,
+            val_sisdr=val_sisdr,
+            validation_ran=validation_ran,
+        )
 
         
         # Save Latest Checkpoint (Every Epoch)
@@ -682,6 +735,7 @@ def train(args):
                 epoch,
                 best_val_sisdr,
                 last_val_sisdr,
+                phase_state,
             ),
             os.path.join(args.checkpoint_dir, "latest_model.pth")
         )
@@ -837,18 +891,21 @@ if __name__ == "__main__":
     parser.add_argument('--val_batches', type=int, default=0, help="Limit number of validation batches (0 = full)")
     parser.add_argument('--estoi', action='store_true', help="Compute ESTOI during validation (slow, disabled by default)")
     parser.add_argument('--seed', type=int, default=42, help='Global random seed for reproducible training and evaluation')
-    parser.add_argument('--phase1_epochs', type=int, default=8, help='Phase 1 duration: latent MSE-only training epochs')
+    parser.add_argument('--phase1_epochs', type=int, default=8, help='Legacy fixed phase-1 epoch setting (unused in metric-driven schedule)')
+    parser.add_argument('--phase1_mse_threshold', type=float, default=0.87, help='Phase 1 ends when average train MSE falls below this threshold')
     parser.add_argument('--phase1_lr', type=float, default=1e-4, help='Phase 1 generator learning rate')
     parser.add_argument('--phase1_batch_size', type=int, default=64, help='Phase 1 training batch size')
     parser.add_argument('--phase2_lambda_mel_start', type=int, default=2, help='Starting lambda_mel value for phase 2 ramp')
     parser.add_argument('--phase2_lambda_mel_end', type=int, default=15, help='Final lambda_mel value for phase 2 ramp and later phases')
-    parser.add_argument('--phase2_hold_epochs', type=int, default=1, help='Extra phase 2 epochs to keep lambda_mel fixed at the final value')
+    parser.add_argument('--phase2_hold_epochs', type=int, default=1, help='Legacy fixed phase-2 hold epoch setting (unused in metric-driven schedule)')
     parser.add_argument('--phase2_batch_size', type=int, default=16, help='Phase 2 training batch size')
-    parser.add_argument('--phase3_epochs', type=int, default=1, help='Phase 3 duration: discriminator warmup epochs')
+    parser.add_argument('--phase3_epochs', type=int, default=2, help='Phase 3 duration: discriminator warmup epochs')
     parser.add_argument('--phase3_batch_size', type=int, default=8, help='Phase 3 training batch size')
     parser.add_argument('--phase3_lr', type=float, default=1e-5, help='Phase 3 learning rate')
     parser.add_argument('--phase4_lr', type=float, default=1e-5, help='Phase 4 initial learning rate before scheduler updates')
     parser.add_argument('--phase4_d_lr', type=float, default=1e-5, help='Phase 4 discriminator learning rate before scheduler updates')
+    parser.add_argument('--phase4_scheduler_patience', type=int, default=3, help='Phase 4 ReduceLROnPlateau patience')
+    parser.add_argument('--phase4_scheduler_factor', type=float, default=0.5, help='Phase 4 ReduceLROnPlateau factor')
     
     parser.add_argument('--lambda_gan', type=float, default=0.5, help="Weight for GAN Adversarial Loss")
     parser.add_argument('--lambda_feat', type=float, default=1, help="Weight for GAN Feature Matching Loss")
