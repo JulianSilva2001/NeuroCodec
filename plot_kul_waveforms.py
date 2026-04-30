@@ -55,9 +55,12 @@ def plot_sample(mix, clean, eeg, subject, index, channels, target_fs, output_pat
     )
 
     audio_len = min(len(audio_time), len(mix_np), len(clean_np))
-    axes[0].plot(audio_time[:audio_len], mix_np[:audio_len], color="#7E57C2", linewidth=1.0)
+    interferer_np = mix_np[:audio_len] - clean_np[:audio_len]
+    axes[0].plot(audio_time[:audio_len], mix_np[:audio_len], color="#7E57C2", linewidth=0.9, label="Mixture")
+    axes[0].plot(audio_time[:audio_len], interferer_np, color="#E53935", linewidth=0.9, alpha=0.85, label="Interferer ~= mix - target")
     axes[0].set_title(f"KUL sample {index} | subject: {subject}")
     axes[0].set_ylabel("Mix amp.")
+    axes[0].legend(loc="upper right")
     axes[0].grid(alpha=0.25)
 
     axes[1].plot(audio_time[:audio_len], clean_np[:audio_len], color="#1E88E5", linewidth=1.0)
