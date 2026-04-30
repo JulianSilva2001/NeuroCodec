@@ -47,20 +47,23 @@ def plot_sample(mix, clean, eeg, subject, index, channels, target_fs, output_pat
     eeg_time = np.arange(eeg_np.shape[-1]) / eeg_fs
 
     fig, axes = plt.subplots(
-        2,
+        3,
         1,
-        figsize=(14, 7),
+        figsize=(14, 9),
         sharex=False,
-        gridspec_kw={"height_ratios": [1.15, 1.6]},
+        gridspec_kw={"height_ratios": [1.0, 1.0, 1.6]},
     )
 
     audio_len = min(len(audio_time), len(mix_np), len(clean_np))
-    axes[0].plot(audio_time[:audio_len], mix_np[:audio_len], color="#7E57C2", linewidth=1.0, label="Mixture")
-    axes[0].plot(audio_time[:audio_len], clean_np[:audio_len], color="#1E88E5", linewidth=1.0, label="Target")
+    axes[0].plot(audio_time[:audio_len], mix_np[:audio_len], color="#7E57C2", linewidth=1.0)
     axes[0].set_title(f"KUL sample {index} | subject: {subject}")
-    axes[0].set_ylabel("Audio amplitude")
-    axes[0].legend(loc="upper right")
+    axes[0].set_ylabel("Mix amp.")
     axes[0].grid(alpha=0.25)
+
+    axes[1].plot(audio_time[:audio_len], clean_np[:audio_len], color="#1E88E5", linewidth=1.0)
+    axes[1].set_title("Target audio")
+    axes[1].set_ylabel("Target amp.")
+    axes[1].grid(alpha=0.25)
 
     valid_channels = [ch for ch in channels if 0 <= ch < eeg_np.shape[0]]
     if len(valid_channels) != len(channels):
@@ -81,15 +84,15 @@ def plot_sample(mix, clean, eeg, subject, index, channels, target_fs, output_pat
 
     for row, (ch, channel) in enumerate(zip(valid_channels, normalized_channels)):
         offset = (len(valid_channels) - row - 1) * spacing
-        axes[1].plot(eeg_time, channel + offset, linewidth=0.9, label=f"Ch {ch}")
-        axes[1].text(eeg_time[-1] + 0.02 * duration, offset, f"Ch {ch}", va="center", fontsize=9)
+        axes[2].plot(eeg_time, channel + offset, linewidth=0.9, label=f"Ch {ch}")
+        axes[2].text(eeg_time[-1] + 0.02 * duration, offset, f"Ch {ch}", va="center", fontsize=9)
 
-    axes[1].set_title("Selected EEG channels, z-scored and vertically offset")
-    axes[1].set_xlabel("Time (s)")
-    axes[1].set_ylabel("EEG channels")
-    axes[1].set_yticks([])
-    axes[1].grid(alpha=0.25)
-    axes[1].set_xlim(0, max(duration, eeg_time[-1] if len(eeg_time) else duration))
+    axes[2].set_title("Selected EEG channels, z-scored and vertically offset")
+    axes[2].set_xlabel("Time (s)")
+    axes[2].set_ylabel("EEG channels")
+    axes[2].set_yticks([])
+    axes[2].grid(alpha=0.25)
+    axes[2].set_xlim(0, max(duration, eeg_time[-1] if len(eeg_time) else duration))
 
     fig.tight_layout()
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
