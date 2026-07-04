@@ -100,6 +100,3 @@ python train_neurocodec.py --evaluate --noise_cue --gpu 0
 -   **Current Best Model**: Trained for 50 epochs on Normalized-2 dataset.
 -   **Codecs**: Uses DAC 44kHz backbone.
 
-## 🤝 Acknowledgements
-Based on the **M3ANet** architecture.
-Refactored by the DeepMind Advanced Agentic Coding Team.
